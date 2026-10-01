@@ -6,17 +6,17 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Position;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::api::models::{
     AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, PlaylistDetail, PlaylistSummary,
     SearchKind, SearchResults, Track,
 };
-use crate::api::MusicApi;
-use crate::config::Config;
+use crate::api::{MusicApi, StreamFormat};
+use crate::config::{Config, PlaybackEngine};
 use crate::lyrics::{self, LyricsData};
 use crate::player::queue::{Advance, Queue};
-use crate::player::{PlayerCmd, PlayerEvent, PlayerHandle};
+use crate::player::{PlayerCmd, PlayerEvent, PlayerHandle, TrackEvent};
 use crate::sponsorblock::{self, Segment};
 
 /// All inputs to the app converge into this enum; the main loop owns the
@@ -55,46 +55,56 @@ pub enum ApiMsg {
         result: Result<PlaylistDetail, String>,
     },
     RadioDone {
+        queue_seq: u64,
+        seed: String,
         result: Result<Vec<Track>, String>,
     },
     /// Audio stream URL resolved for a track (see [`MusicApi::stream_url`]).
     StreamResolved {
+        play_seq: u64,
         video_id: String,
         attempt: u8,
         result: Result<String, String>,
     },
     LyricsDone {
-        video_id: String,
+        play_seq: u64,
         data: LyricsData,
     },
     SponsorDone {
-        video_id: String,
+        play_seq: u64,
         segments: Vec<Segment>,
     },
     CoverLoaded {
-        video_id: String,
-        image: Box<image::DynamicImage>,
+        play_seq: u64,
+        image: Option<Box<image::DynamicImage>>,
     },
     HomeDone {
+        seq: u64,
         result: Result<(Vec<Track>, Vec<AlbumSummary>), String>,
     },
     LibraryTracks {
+        seq: u64,
         title: String,
         result: Result<Vec<Track>, String>,
     },
     LibraryPlaylists {
+        seq: u64,
         result: Result<Vec<PlaylistSummary>, String>,
     },
     LibraryAlbums {
+        seq: u64,
         result: Result<Vec<AlbumSummary>, String>,
     },
     LibraryArtists {
+        seq: u64,
         result: Result<Vec<ArtistSummary>, String>,
     },
     LoginDone {
+        seq: u64,
         result: Result<(), String>,
     },
     LogoutDone {
+        seq: u64,
         result: Result<(), String>,
     },
 }
@@ -150,15 +160,41 @@ const DEFAULT_KEYS: &[(Action, &str, KeyCode)] = &[
 
 /// Download and decode album art. Failures are silent - a missing cover
 /// must never interrupt playback.
+static COVER_DECODE_LIMIT: Semaphore = Semaphore::const_new(2);
+
 async fn fetch_cover(http: reqwest::Client, url: String) -> Option<image::DynamicImage> {
-    let bytes = http.get(&url).send().await.ok()?.bytes().await.ok()?;
-    match image::load_from_memory(&bytes) {
-        Ok(img) => Some(img),
-        Err(e) => {
-            tracing::debug!("cover decode failed: {e}");
-            None
-        }
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    let mut response = http.get(&url).send().await.ok()?.error_for_status().ok()?;
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_BYTES as u64)
+    {
+        return None;
     }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len() + chunk.len() > MAX_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    // Aborting an async task cannot stop a decoder already running in
+    // spawn_blocking. Keep those orphaned decodes bounded during fast skips.
+    let permit = COVER_DECODE_LIMIT.acquire().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(4096);
+        limits.max_image_height = Some(4096);
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        reader.limits(limits);
+        reader.decode().ok().map(|img| img.thumbnail(544, 544))
+    })
+    .await
+    .ok()?
 }
 
 /// Detected browsers first (the one-keystroke path), then the fallbacks.
@@ -196,12 +232,53 @@ fn nav_list(selected: &mut usize, len: usize, key: KeyCode) -> bool {
 }
 
 fn build_keymap(overrides: &HashMap<String, String>) -> HashMap<KeyCode, Action> {
-    let mut map = HashMap::new();
+    let mut map: HashMap<KeyCode, Action> = DEFAULT_KEYS
+        .iter()
+        .map(|(action, _, key)| (*key, *action))
+        .collect();
     for (action, name, default) in DEFAULT_KEYS {
-        let key = overrides
-            .get(*name)
-            .and_then(|s| crate::config::parse_key(s))
-            .unwrap_or(*default);
+        let Some(raw) = overrides.get(*name) else {
+            continue;
+        };
+        let Some(key) = crate::config::parse_key(raw) else {
+            tracing::warn!("忽略无效键位配置 {name}={raw:?}");
+            continue;
+        };
+        if key == *default {
+            continue;
+        }
+        if matches!(
+            key,
+            KeyCode::Enter
+                | KeyCode::Esc
+                | KeyCode::Backspace
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Char(
+                    'j' | 'k'
+                        | 'g'
+                        | 'G'
+                        | 'a'
+                        | 'A'
+                        | 'x'
+                        | 'J'
+                        | 'K'
+                        | 'P'
+                        | '1'
+                        | '2'
+                        | '3'
+                        | '4'
+                        | '['
+                        | ']'
+                )
+        ) || map.contains_key(&key)
+        {
+            tracing::warn!("忽略冲突键位配置 {name}={raw:?}");
+            continue;
+        }
+        map.remove(default);
         map.insert(key, *action);
     }
     map
@@ -255,6 +332,7 @@ pub const LIBRARY_MENU: [&str; 5] = [
 pub struct LibraryState {
     pub selected: usize,
     pub loading: bool,
+    pub failed: bool,
 }
 
 /// One row on the login screen.
@@ -293,10 +371,15 @@ pub struct SearchState {
     pub kind_idx: usize,
     pub results: SearchResults,
     pub selected: usize,
-    pub loading: bool,
+    pub loading: [bool; 4],
+    pub errors: [Option<String>; 4],
 }
 
 impl SearchState {
+    pub fn is_loading(&self) -> bool {
+        self.loading[self.kind_idx]
+    }
+
     pub fn kind(&self) -> SearchKind {
         SearchKind::ALL[self.kind_idx]
     }
@@ -380,7 +463,6 @@ impl BrowsePage {
 }
 
 pub struct LyricsState {
-    pub video_id: String,
     pub data: LyricsData,
     pub loading: bool,
     /// Manual scroll offset for plain lyrics.
@@ -390,9 +472,9 @@ pub struct LyricsState {
 /// Album art for the now-playing page. The protocol object is built once
 /// per track and re-encoded by the widget whenever the area changes.
 pub struct CoverState {
-    pub video_id: String,
     pub protocol: Option<ratatui_image::protocol::StatefulProtocol>,
     pub loading: bool,
+    attempted: bool,
 }
 
 /// Mirror of the mpv-side playback state for rendering.
@@ -416,8 +498,10 @@ pub struct App {
     pub pb: PlaybackState,
     /// Set when the user asks to restart a dead player; main re-wires it.
     pub player_restart_requested: bool,
+    restart_pending_track: bool,
     pub status: Option<String>,
     status_ttl: u8,
+    pub detail_retry_hint: Option<String>,
 
     pub api: Arc<dyn MusicApi>,
     pub http: reqwest::Client,
@@ -435,10 +519,13 @@ pub struct App {
     pub library: LibraryState,
     pub login: LoginState,
     pub browse_stack: Vec<BrowsePage>,
+    browse_root_view: MainView,
     pub queue: Queue,
     pub queue_selected: usize,
     pub radio_on: bool,
     radio_inflight: bool,
+    queue_seq: u64,
+    play_seq: u64,
     pub lyrics: LyricsState,
     pub cover: CoverState,
     /// None when the terminal cannot show images at all.
@@ -446,18 +533,67 @@ pub struct App {
     /// The track being shown on the now-playing page.
     pub now_playing: Option<Track>,
     pub history: crate::history::PlaybackHistory,
+    pub history_selected: usize,
     sponsor_video_id: String,
     sponsor_segments: Vec<Segment>,
     current_video_id: Option<String>,
     stream_attempt: u8,
+    load_requested: bool,
     resume_position: Option<f64>,
+    resume_target_id: Option<String>,
     pub help_visible: bool,
+    pub help_scroll: u16,
     search_seq: u64,
+    home_seq: u64,
+    auth_seq: u64,
     browse_seq: u64,
+    library_seq: u64,
     keymap: HashMap<KeyCode, Action>,
     /// Filled by main after each draw; consumed by the mouse handler.
     pub ui_layout: crate::ui::UiLayout,
     last_click: Option<(Instant, u16, u16)>,
+    last_persist: Instant,
+    persist_task: Option<tokio::task::JoinHandle<()>>,
+    track_tasks: TrackTasks,
+    search_tasks: [Option<tokio::task::JoinHandle<()>>; 4],
+    browse_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct TrackTasks {
+    stream: Option<tokio::task::JoinHandle<()>>,
+    lyrics: Option<tokio::task::JoinHandle<()>>,
+    sponsor: Option<tokio::task::JoinHandle<()>>,
+    cover: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TrackTasks {
+    fn abort(&mut self) {
+        for task in [
+            &mut self.stream,
+            &mut self.lyrics,
+            &mut self.sponsor,
+            &mut self.cover,
+        ] {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.track_tasks.abort();
+        for task in &mut self.search_tasks {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+        if let Some(task) = self.browse_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl App {
@@ -490,8 +626,10 @@ impl App {
                 alive: false,
             },
             player_restart_requested: false,
+            restart_pending_track: false,
             status: None,
             status_ttl: 0,
+            detail_retry_hint: None,
             api,
             http,
             data_dir,
@@ -505,7 +643,8 @@ impl App {
                 kind_idx: 0,
                 results: SearchResults::default(),
                 selected: 0,
-                loading: false,
+                loading: [false; 4],
+                errors: std::array::from_fn(|_| None),
             },
             home: HomeState {
                 tracks: Vec::new(),
@@ -516,6 +655,7 @@ impl App {
             library: LibraryState {
                 selected: 0,
                 loading: false,
+                failed: false,
             },
             login: LoginState {
                 methods: login_methods(),
@@ -523,35 +663,67 @@ impl App {
                 busy: false,
             },
             browse_stack: Vec::new(),
+            browse_root_view: MainView::Home,
             queue: Queue::default(),
             queue_selected: 0,
             radio_on,
             radio_inflight: false,
+            queue_seq: 0,
+            play_seq: 0,
             lyrics: LyricsState {
-                video_id: String::new(),
                 data: LyricsData::None,
                 loading: false,
                 scroll: 0,
             },
             cover: CoverState {
-                video_id: String::new(),
                 protocol: None,
                 loading: false,
+                attempted: false,
             },
             picker,
             now_playing: None,
             history: crate::history::PlaybackHistory::default(),
+            history_selected: 0,
             sponsor_video_id: String::new(),
             sponsor_segments: Vec::new(),
             current_video_id: None,
             stream_attempt: 0,
+            load_requested: false,
             resume_position: None,
+            resume_target_id: None,
             help_visible: false,
+            help_scroll: 0,
             search_seq: 0,
+            home_seq: 0,
+            auth_seq: 0,
             browse_seq: 0,
+            library_seq: 0,
             keymap,
             ui_layout: crate::ui::UiLayout::default(),
             last_click: None,
+            last_persist: Instant::now(),
+            persist_task: None,
+            track_tasks: TrackTasks::default(),
+            search_tasks: std::array::from_fn(|_| None),
+            browse_task: None,
+        }
+    }
+
+    pub fn key_label(&self, action: Action) -> String {
+        let key = self
+            .keymap
+            .iter()
+            .find_map(|(key, bound)| (*bound == action).then_some(key));
+        match key {
+            Some(KeyCode::Char(' ')) => "Space".into(),
+            Some(KeyCode::Char(c)) => c.to_string(),
+            Some(KeyCode::Tab) => "Tab".into(),
+            Some(KeyCode::Left) => "Left".into(),
+            Some(KeyCode::Right) => "Right".into(),
+            Some(KeyCode::Up) => "Up".into(),
+            Some(KeyCode::Down) => "Down".into(),
+            Some(other) => format!("{other:?}"),
+            None => "?".into(),
         }
     }
 
@@ -581,13 +753,20 @@ impl App {
         let Ok(Some(saved)) = crate::session::SavedSession::load(&path) else {
             return;
         };
-        let Some(current) = saved.current else {
-            return;
-        };
-        if self.queue.restore(saved.tracks, current, saved.repeat) {
+        let resume_target_id = saved
+            .current
+            .and_then(|i| saved.tracks.get(i))
+            .map(|t| t.video_id.clone());
+        if self
+            .queue
+            .restore(saved.tracks, saved.current, saved.repeat)
+        {
             self.radio_on = saved.radio_on;
-            self.queue_selected = current;
-            self.resume_position = (saved.position > 3.0).then_some(saved.position);
+            self.queue_selected = saved.current.unwrap_or(0);
+            self.resume_position = saved
+                .current
+                .and_then(|_| (saved.position > 3.0).then_some(saved.position));
+            self.resume_target_id = resume_target_id;
             self.toast("已恢复上次队列，按 Enter 继续播放");
         }
     }
@@ -597,13 +776,57 @@ impl App {
     }
 
     pub fn save_session(&self) {
-        let Some(saved) =
-            crate::session::SavedSession::from_queue(&self.queue, self.pb.time_pos, self.radio_on)
-        else {
+        match crate::session::SavedSession::from_queue(&self.queue, self.pb.time_pos, self.radio_on)
+        {
+            Some(saved) => {
+                if let Err(e) = saved.save(&self.session_path()) {
+                    tracing::warn!("{e:#}");
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(self.session_path());
+            }
+        }
+    }
+
+    fn maybe_persist(&mut self) {
+        if self
+            .persist_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+            || self.last_persist.elapsed() < Duration::from_secs(15)
+        {
             return;
-        };
-        if let Err(e) = saved.save(&self.session_path()) {
-            tracing::warn!("{e:#}");
+        }
+        self.persist_task = None;
+        self.last_persist = Instant::now();
+        if self.queue.is_empty() && self.history.entries().is_empty() {
+            return;
+        }
+        let saved =
+            crate::session::SavedSession::from_queue(&self.queue, self.pb.time_pos, self.radio_on);
+        let history = self.history.clone();
+        let session_path = self.session_path();
+        let history_path = self.data_dir.join("playback-history.json");
+        self.persist_task = Some(tokio::task::spawn_blocking(move || {
+            if let Some(saved) = saved {
+                if let Err(e) = saved.save(&session_path) {
+                    tracing::warn!("{e:#}");
+                }
+            } else if let Err(e) = std::fs::remove_file(&session_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("删除旧播放会话失败: {e}");
+                }
+            }
+            if let Err(e) = history.save(&history_path) {
+                tracing::warn!("{e:#}");
+            }
+        }));
+    }
+
+    pub async fn wait_persistence(&mut self) {
+        if let Some(task) = self.persist_task.take() {
+            let _ = task.await;
         }
     }
 
@@ -633,15 +856,18 @@ impl App {
             return;
         }
         self.home.loading = true;
+        self.home_seq = self.home_seq.wrapping_add(1);
+        let seq = self.home_seq;
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = api.home().await.map_err(|e| format!("{e}"));
-            let _ = tx.send(AppEvent::Api(ApiMsg::HomeDone { result }));
+            let _ = tx.send(AppEvent::Api(ApiMsg::HomeDone { seq, result }));
         });
     }
 
-    pub fn handle(&mut self, ev: AppEvent) {
+    /// Returns whether this event changed pixels that need to be redrawn.
+    pub fn handle(&mut self, ev: AppEvent) -> bool {
         match ev {
             AppEvent::Key(key) => self.on_key(key),
             AppEvent::Mouse(me) => self.on_mouse(me),
@@ -652,19 +878,25 @@ impl App {
             }
             AppEvent::Resize => {}
             AppEvent::Tick => {
+                let mut redraw = false;
                 if self.status_ttl > 0 {
                     self.status_ttl -= 1;
                     if self.status_ttl == 0 {
                         self.status = None;
+                        redraw = true;
                     }
                 }
                 if self.pb.loading {
                     self.pb.loading_secs += 0.25;
+                    redraw = true;
                 }
+                self.maybe_persist();
+                return redraw;
             }
             AppEvent::Player(pe) => self.on_player_event(pe),
             AppEvent::Api(msg) => self.on_api_msg(msg),
         }
+        true
     }
 
     // ---------- playback ----------
@@ -676,7 +908,48 @@ impl App {
         self.start_track(track);
     }
 
+    fn retry_stream_resolution(&mut self, play_seq: u64, video_id: String) -> bool {
+        if self.stream_attempt >= 2 {
+            return false;
+        }
+        self.stream_attempt += 1;
+        self.load_requested = false;
+        self.pb.loading = true;
+        self.pb.loading_secs = 0.0;
+        self.toast(format!("重新解析播放地址 ({}/2)", self.stream_attempt));
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        let attempt = self.stream_attempt;
+        let format = if self.config.playback.engine == PlaybackEngine::Native {
+            StreamFormat::Mp4Aac
+        } else {
+            StreamFormat::Best
+        };
+        if let Some(task) = self.track_tasks.stream.take() {
+            task.abort();
+        }
+        self.track_tasks.stream = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(20), api.stream_url(&video_id, format))
+                    .await
+                    .map_err(|_| "解析播放地址超时".to_string())
+                    .and_then(|result| result.map_err(|e| format!("{e:#}")));
+            let _ = tx.send(AppEvent::Api(ApiMsg::StreamResolved {
+                play_seq,
+                video_id,
+                attempt,
+                result,
+            }));
+        }));
+        true
+    }
+
     fn start_track(&mut self, track: Track) {
+        self.track_tasks.abort();
+        self.play_seq = self.play_seq.wrapping_add(1);
+        let play_seq = self.play_seq;
+        self.player.send(PlayerCmd::Stop);
         self.now_playing = Some(track.clone());
         self.history.record(track.clone());
         self.pb.current_title = Some(format!("{} - {}", track.title, track.artists));
@@ -684,9 +957,12 @@ impl App {
         self.pb.loading_secs = 0.0;
         self.pb.time_pos = 0.0;
         self.pb.duration = track.duration_secs.map(f64::from).unwrap_or(0.0);
-        self.resume_position = None;
+        if self.resume_target_id.take().as_deref() != Some(track.video_id.as_str()) {
+            self.resume_position = None;
+        }
         self.current_video_id = Some(track.video_id.clone());
         self.stream_attempt = 0;
+        self.load_requested = false;
 
         // Resolve the stream URL in-process rather than letting mpv shell out
         // to yt-dlp. The result is applied in `ApiMsg::StreamResolved`, which
@@ -695,22 +971,28 @@ impl App {
             let api = self.api.clone();
             let tx = self.tx.clone();
             let vid = track.video_id.clone();
-            tokio::spawn(async move {
-                let result = tokio::time::timeout(Duration::from_secs(20), api.stream_url(&vid))
-                    .await
-                    .map_err(|_| "解析播放地址超时".to_string())
-                    .and_then(|result| result.map_err(|e| format!("{e:#}")));
+            let format = if self.config.playback.engine == PlaybackEngine::Native {
+                StreamFormat::Mp4Aac
+            } else {
+                StreamFormat::Best
+            };
+            self.track_tasks.stream = Some(tokio::spawn(async move {
+                let result =
+                    tokio::time::timeout(Duration::from_secs(20), api.stream_url(&vid, format))
+                        .await
+                        .map_err(|_| "解析播放地址超时".to_string())
+                        .and_then(|result| result.map_err(|e| format!("{e:#}")));
                 let _ = tx.send(AppEvent::Api(ApiMsg::StreamResolved {
+                    play_seq,
                     video_id: vid,
                     attempt: 0,
                     result,
                 }));
-            });
+            }));
         }
 
         // Lyrics for the new track.
         self.lyrics = LyricsState {
-            video_id: track.video_id.clone(),
             data: LyricsData::None,
             loading: self.config.lyrics.enabled,
             scroll: 0,
@@ -720,36 +1002,20 @@ impl App {
             let api = self.api.clone();
             let tx = self.tx.clone();
             let t = track.clone();
-            tokio::spawn(async move {
+            self.track_tasks.lyrics = Some(tokio::spawn(async move {
                 let data = lyrics::fetch(http, api, t.clone()).await;
-                let _ = tx.send(AppEvent::Api(ApiMsg::LyricsDone {
-                    video_id: t.video_id,
-                    data,
-                }));
-            });
+                let _ = tx.send(AppEvent::Api(ApiMsg::LyricsDone { play_seq, data }));
+            }));
         }
 
         // SponsorBlock segments for the new track.
         // Album art - only fetched when the terminal can display it.
         self.cover = CoverState {
-            video_id: track.video_id.clone(),
             protocol: None,
             loading: false,
+            attempted: false,
         };
-        if let (Some(url), true) = (track.cover_url.clone(), self.picker.is_some()) {
-            self.cover.loading = true;
-            let http = self.http.clone();
-            let tx = self.tx.clone();
-            let vid = track.video_id.clone();
-            tokio::spawn(async move {
-                if let Some(image) = fetch_cover(http, url).await {
-                    let _ = tx.send(AppEvent::Api(ApiMsg::CoverLoaded {
-                        video_id: vid,
-                        image: Box::new(image),
-                    }));
-                }
-            });
-        }
+        self.maybe_load_cover();
 
         self.sponsor_video_id = track.video_id.clone();
         self.sponsor_segments.clear();
@@ -758,16 +1024,31 @@ impl App {
             let tx = self.tx.clone();
             let vid = track.video_id.clone();
             let cats = self.config.sponsorblock.categories.clone();
-            tokio::spawn(async move {
+            self.track_tasks.sponsor = Some(tokio::spawn(async move {
                 let segments = sponsorblock::fetch(http, vid.clone(), cats).await;
-                let _ = tx.send(AppEvent::Api(ApiMsg::SponsorDone {
-                    video_id: vid,
-                    segments,
-                }));
-            });
+                let _ = tx.send(AppEvent::Api(ApiMsg::SponsorDone { play_seq, segments }));
+            }));
         }
 
         self.maybe_refill_radio();
+    }
+
+    fn maybe_load_cover(&mut self) {
+        if self.main_view != MainView::NowPlaying || self.cover.attempted || self.picker.is_none() {
+            return;
+        }
+        let Some(url) = self.now_playing.as_ref().and_then(|t| t.cover_url.clone()) else {
+            return;
+        };
+        self.cover.attempted = true;
+        self.cover.loading = true;
+        let http = self.http.clone();
+        let tx = self.tx.clone();
+        let play_seq = self.play_seq;
+        self.track_tasks.cover = Some(tokio::spawn(async move {
+            let image = fetch_cover(http, url).await.map(Box::new);
+            let _ = tx.send(AppEvent::Api(ApiMsg::CoverLoaded { play_seq, image }));
+        }));
     }
 
     /// Play `start` within `tracks`, making that list the queue so playback
@@ -776,6 +1057,7 @@ impl App {
         let count = tracks.len();
         match self.queue.set_context(tracks, start) {
             Some(idx) => {
+                self.queue_seq = self.queue_seq.wrapping_add(1);
                 self.start_track_at(idx);
                 if count > 1 {
                     self.toast(format!("播放中 - 队列 {} 首（第 {} 首）", count, idx + 1));
@@ -786,11 +1068,19 @@ impl App {
     }
 
     fn stop_playback_ui(&mut self) {
+        self.track_tasks.abort();
+        self.lyrics.loading = false;
+        self.cover.loading = false;
+        self.play_seq = self.play_seq.wrapping_add(1);
+        self.player.send(PlayerCmd::Stop);
         self.pb.current_title = None;
         self.pb.loading = false;
         self.pb.time_pos = 0.0;
         self.pb.duration = 0.0;
         self.current_video_id = None;
+        self.resume_target_id = None;
+        self.resume_position = None;
+        self.load_requested = false;
     }
 
     fn advance(&mut self, advance: Advance) {
@@ -807,12 +1097,48 @@ impl App {
         match ev {
             PlayerEvent::Ready => {
                 self.pb.alive = true;
+                if self.restart_pending_track {
+                    self.restart_pending_track = false;
+                    if let Some(index) = self.queue.current_index() {
+                        self.resume_position = (self.pb.time_pos > 3.0).then_some(self.pb.time_pos);
+                        self.resume_target_id = self.current_video_id.clone();
+                        self.start_track_at(index);
+                    }
+                }
             }
             PlayerEvent::InitFailed(e) => {
+                self.track_tasks.abort();
                 self.pb.alive = false;
+                self.pb.loading = false;
+                self.pb.paused = true;
+                self.load_requested = false;
                 self.toast(format!("播放器启动失败: {e}"));
             }
-            PlayerEvent::FileLoaded => {
+            PlayerEvent::Track { play_seq, event } => {
+                if play_seq == self.play_seq {
+                    self.on_track_event(event);
+                }
+            }
+            PlayerEvent::Volume(v) => self.pb.volume = v,
+            PlayerEvent::Muted(m) => self.pb.muted = m,
+            PlayerEvent::Died => {
+                self.track_tasks.abort();
+                self.pb.alive = false;
+                self.pb.loading = false;
+                self.pb.paused = true;
+                self.load_requested = false;
+                self.toast("播放器已退出 - 按 R 重启");
+            }
+        }
+    }
+
+    fn on_track_event(&mut self, ev: TrackEvent) {
+        match ev {
+            TrackEvent::FileLoaded => {
+                if !self.load_requested {
+                    return;
+                }
+                self.load_requested = false;
                 self.pb.loading = false;
                 self.pb.loading_secs = 0.0;
                 self.pb.time_pos = 0.0;
@@ -821,27 +1147,46 @@ impl App {
                     self.pb.time_pos = position;
                 }
             }
-            PlayerEvent::TimePos(t) => {
-                self.pb.time_pos = t;
-                self.check_sponsor_skip(t);
+            TrackEvent::TimePos(t) => {
+                if !self.pb.loading && self.current_video_id.is_some() {
+                    self.pb.time_pos = t;
+                    self.check_sponsor_skip(t);
+                }
             }
-            PlayerEvent::Duration(d) => self.pb.duration = d,
-            PlayerEvent::Paused(p) => self.pb.paused = p,
-            PlayerEvent::Volume(v) => self.pb.volume = v,
-            PlayerEvent::Muted(m) => self.pb.muted = m,
-            PlayerEvent::TrackEnded => {
+            TrackEvent::Duration(d)
+                if self.current_video_id.is_some() && (!self.pb.loading || self.load_requested) =>
+            {
+                self.pb.duration = d;
+            }
+            TrackEvent::Duration(_) => {}
+            TrackEvent::Paused(p) => self.pb.paused = p,
+            TrackEvent::TrackEnded => {
+                if self.pb.loading || self.current_video_id.is_none() {
+                    return;
+                }
                 let adv = self.queue.advance_on_end();
                 self.advance(adv);
             }
-            PlayerEvent::LoadFailed(e) => {
+            TrackEvent::LoadFailed(e) => {
+                if self.current_video_id.is_none() || (self.pb.loading && !self.load_requested) {
+                    return;
+                }
+                if e.starts_with("音频下载失败") {
+                    if self.pb.time_pos > 1.0 {
+                        self.resume_position = Some(self.pb.time_pos);
+                    }
+                    if self.retry_stream_resolution(
+                        self.play_seq,
+                        self.current_video_id.clone().unwrap(),
+                    ) {
+                        return;
+                    }
+                }
+                self.load_requested = false;
                 self.pb.loading = false;
                 self.toast(format!("加载失败，跳到下一首: {e}"));
                 let adv = self.queue.next_manual();
                 self.advance(adv);
-            }
-            PlayerEvent::Died => {
-                self.pb.alive = false;
-                self.toast("mpv 已退出 - 按 R 重启播放器");
             }
         }
     }
@@ -866,22 +1211,38 @@ impl App {
     // ---------- async task launchers ----------
 
     fn fire_kind_search(&mut self) {
-        if self.search.query.is_empty() {
+        if self.search.query.is_empty() || self.search.is_loading() {
             return;
         }
-        self.search.loading = true;
+        let kind_idx = self.search.kind_idx;
+        self.search.loading[kind_idx] = true;
+        self.search.errors[kind_idx] = None;
         let seq = self.search_seq;
         let kind = self.search.kind();
         let query = self.search.query.clone();
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        if let Some(task) = self.search_tasks[kind_idx].take() {
+            task.abort();
+        }
+        self.search_tasks[kind_idx] = Some(tokio::spawn(async move {
             let result = api.search(&query, kind).await.map_err(|e| format!("{e}"));
             let _ = tx.send(AppEvent::Api(ApiMsg::SearchDone { seq, kind, result }));
-        });
+        }));
     }
 
     fn open_album(&mut self, id: String, title: String) {
+        if self.detail_retry_hint.take().is_some() {
+            self.status = None;
+            self.status_ttl = 0;
+        }
+        if let Some(task) = self.browse_task.take() {
+            task.abort();
+        }
+        if self.main_view != MainView::Browse {
+            self.browse_stack.clear();
+            self.browse_root_view = self.main_view;
+        }
         self.browse_stack.push(BrowsePage::Album {
             title,
             data: None,
@@ -892,13 +1253,24 @@ impl App {
         let seq = self.browse_seq;
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.browse_task = Some(tokio::spawn(async move {
             let result = api.album(&id).await.map_err(|e| format!("{e}"));
             let _ = tx.send(AppEvent::Api(ApiMsg::AlbumDone { seq, result }));
-        });
+        }));
     }
 
     fn open_artist(&mut self, id: String, name: String) {
+        if self.detail_retry_hint.take().is_some() {
+            self.status = None;
+            self.status_ttl = 0;
+        }
+        if let Some(task) = self.browse_task.take() {
+            task.abort();
+        }
+        if self.main_view != MainView::Browse {
+            self.browse_stack.clear();
+            self.browse_root_view = self.main_view;
+        }
         self.browse_stack.push(BrowsePage::Artist {
             name,
             data: None,
@@ -909,13 +1281,24 @@ impl App {
         let seq = self.browse_seq;
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.browse_task = Some(tokio::spawn(async move {
             let result = api.artist(&id).await.map_err(|e| format!("{e}"));
             let _ = tx.send(AppEvent::Api(ApiMsg::ArtistDone { seq, result }));
-        });
+        }));
     }
 
     fn open_playlist(&mut self, id: String, title: String) {
+        if self.detail_retry_hint.take().is_some() {
+            self.status = None;
+            self.status_ttl = 0;
+        }
+        if let Some(task) = self.browse_task.take() {
+            task.abort();
+        }
+        if self.main_view != MainView::Browse {
+            self.browse_stack.clear();
+            self.browse_root_view = self.main_view;
+        }
         self.browse_stack.push(BrowsePage::Playlist {
             title,
             data: None,
@@ -926,10 +1309,10 @@ impl App {
         let seq = self.browse_seq;
         let api = self.api.clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.browse_task = Some(tokio::spawn(async move {
             let result = api.playlist(&id).await.map_err(|e| format!("{e}"));
             let _ = tx.send(AppEvent::Api(ApiMsg::PlaylistDone { seq, result }));
-        });
+        }));
     }
 
     fn maybe_refill_radio(&mut self) {
@@ -940,11 +1323,16 @@ impl App {
             return;
         };
         self.radio_inflight = true;
+        let queue_seq = self.queue_seq;
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = api.radio(&seed).await.map_err(|e| format!("{e}"));
-            let _ = tx.send(AppEvent::Api(ApiMsg::RadioDone { result }));
+            let _ = tx.send(AppEvent::Api(ApiMsg::RadioDone {
+                queue_seq,
+                seed,
+                result,
+            }));
         });
     }
 
@@ -956,9 +1344,12 @@ impl App {
                 if seq != self.search_seq {
                     return; // stale query
                 }
-                self.search.loading = false;
+                let kind_idx = SearchKind::ALL.iter().position(|k| *k == kind).unwrap_or(0);
+                self.search_tasks[kind_idx] = None;
+                self.search.loading[kind_idx] = false;
                 match result {
                     Ok(r) => {
+                        self.search.errors[kind_idx] = None;
                         match kind {
                             SearchKind::Songs => self.search.results.tracks = r.tracks,
                             SearchKind::Albums => self.search.results.albums = r.albums,
@@ -969,53 +1360,82 @@ impl App {
                             self.search.selected = 0;
                         }
                     }
-                    Err(e) => self.toast(format!("搜索失败: {e}")),
+                    Err(e) => {
+                        self.search.errors[kind_idx] = Some(e.clone());
+                        self.toast(format!("搜索失败: {e}"));
+                    }
                 }
             }
             ApiMsg::AlbumDone { seq, result } => {
-                if seq != self.browse_seq {
+                if seq != self.browse_seq
+                    || !matches!(self.browse_stack.last(), Some(BrowsePage::Album { .. }))
+                {
                     return;
                 }
+                self.browse_task = None;
                 match (self.browse_stack.last_mut(), result) {
                     (Some(BrowsePage::Album { data, .. }), Ok(d)) => *data = Some(d),
                     (_, Err(e)) => {
                         self.browse_stack.pop();
                         self.sync_view_after_pop();
-                        self.toast(format!("加载专辑失败: {e}"));
+                        tracing::warn!("album load failed: {e}");
+                        self.detail_retry_hint = Some("专辑打开失败，按 Enter 重试当前项".into());
+                        self.toast(format!("专辑失败，按 Enter 重试: {e}"));
                     }
                     _ => {}
                 }
             }
             ApiMsg::ArtistDone { seq, result } => {
-                if seq != self.browse_seq {
+                if seq != self.browse_seq
+                    || !matches!(self.browse_stack.last(), Some(BrowsePage::Artist { .. }))
+                {
                     return;
                 }
+                self.browse_task = None;
                 match (self.browse_stack.last_mut(), result) {
                     (Some(BrowsePage::Artist { data, .. }), Ok(d)) => *data = Some(d),
                     (_, Err(e)) => {
                         self.browse_stack.pop();
                         self.sync_view_after_pop();
-                        self.toast(format!("加载歌手失败: {e}"));
+                        tracing::warn!("artist load failed: {e}");
+                        self.detail_retry_hint = Some("歌手打开失败，按 Enter 重试当前项".into());
+                        self.toast(format!("歌手失败，按 Enter 重试: {e}"));
                     }
                     _ => {}
                 }
             }
             ApiMsg::PlaylistDone { seq, result } => {
-                if seq != self.browse_seq {
+                if seq != self.browse_seq
+                    || !matches!(self.browse_stack.last(), Some(BrowsePage::Playlist { .. }))
+                {
                     return;
                 }
+                self.browse_task = None;
                 match (self.browse_stack.last_mut(), result) {
                     (Some(BrowsePage::Playlist { data, .. }), Ok(d)) => *data = Some(d),
                     (_, Err(e)) => {
                         self.browse_stack.pop();
                         self.sync_view_after_pop();
-                        self.toast(format!("加载歌单失败: {e}"));
+                        tracing::warn!("playlist load failed: {e}");
+                        self.detail_retry_hint = Some("歌单打开失败，按 Enter 重试当前项".into());
+                        self.toast(format!("歌单失败，按 Enter 重试: {e}"));
                     }
                     _ => {}
                 }
             }
-            ApiMsg::RadioDone { result } => {
+            ApiMsg::RadioDone {
+                queue_seq,
+                seed,
+                result,
+            } => {
                 self.radio_inflight = false;
+                if !self.radio_on
+                    || queue_seq != self.queue_seq
+                    || self.queue.items().last().map(|t| t.video_id.as_str()) != Some(seed.as_str())
+                {
+                    self.maybe_refill_radio();
+                    return;
+                }
                 match result {
                     Ok(tracks) => {
                         let added = self.queue.append_unique(tracks);
@@ -1038,46 +1458,27 @@ impl App {
                 }
             }
             ApiMsg::StreamResolved {
+                play_seq,
                 video_id,
                 attempt,
                 result,
             } => {
-                if self.current_video_id.as_deref() != Some(video_id.as_str())
+                if play_seq != self.play_seq
+                    || self.current_video_id.as_deref() != Some(video_id.as_str())
                     || attempt != self.stream_attempt
                 {
                     return;
                 }
+                self.track_tasks.stream = None;
                 let url = match result {
                     Ok(url) => url,
-                    Err(_e) if self.stream_attempt < 2 => {
-                        self.stream_attempt += 1;
-                        self.toast(format!(
-                            "解析播放地址失败，正在重试 ({}/2)",
-                            self.stream_attempt
-                        ));
-                        let api = self.api.clone();
-                        let tx = self.tx.clone();
-                        let retry_id = video_id.clone();
-                        let retry_attempt = self.stream_attempt;
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            let result = tokio::time::timeout(
-                                Duration::from_secs(20),
-                                api.stream_url(&retry_id),
-                            )
-                            .await
-                            .map_err(|_| "解析播放地址超时".to_string())
-                            .and_then(|result| result.map_err(|e| format!("{e:#}")));
-                            let _ = tx.send(AppEvent::Api(ApiMsg::StreamResolved {
-                                video_id: retry_id,
-                                attempt: retry_attempt,
-                                result,
-                            }));
-                        });
+                    Err(_e) if self.retry_stream_resolution(play_seq, video_id.clone()) => {
                         return;
                     }
                     Err(e) => {
-                        if self.config.ytdlp_path.is_none() {
+                        if self.config.ytdlp_path.is_none()
+                            || self.config.playback.engine == PlaybackEngine::Native
+                        {
                             tracing::warn!("stream resolution failed, no ytdl fallback: {e}");
                             self.pb.loading = false;
                             self.toast(format!("解析播放地址失败，跳到下一首: {e}"));
@@ -1089,33 +1490,47 @@ impl App {
                         format!("https://music.youtube.com/watch?v={video_id}")
                     }
                 };
-                self.player.send(PlayerCmd::Load(url));
+                self.load_requested = self.player.send_checked(PlayerCmd::Load { url, play_seq });
+                if !self.load_requested {
+                    self.pb.loading = false;
+                    self.toast("播放器未运行 - 按 R 重启");
+                }
             }
-            ApiMsg::LyricsDone { video_id, data } => {
-                if video_id == self.lyrics.video_id {
+            ApiMsg::LyricsDone { play_seq, data } => {
+                if play_seq == self.play_seq {
+                    self.track_tasks.lyrics = None;
                     self.lyrics.data = data;
                     self.lyrics.loading = false;
                     self.lyrics.scroll = 0;
                 }
             }
-            ApiMsg::SponsorDone { video_id, segments } => {
-                if video_id == self.sponsor_video_id {
+            ApiMsg::SponsorDone { play_seq, segments } => {
+                if play_seq == self.play_seq {
+                    self.track_tasks.sponsor = None;
                     if !segments.is_empty() {
-                        tracing::info!("sponsorblock: {} segments for {video_id}", segments.len());
+                        tracing::info!(
+                            "sponsorblock: {} segments for {}",
+                            segments.len(),
+                            self.sponsor_video_id
+                        );
                     }
                     self.sponsor_segments = segments;
                 }
             }
-            ApiMsg::CoverLoaded { video_id, image } => {
+            ApiMsg::CoverLoaded { play_seq, image } => {
                 // A late arrival for a track we already moved past is dropped.
-                if video_id == self.cover.video_id {
+                if play_seq == self.play_seq {
+                    self.track_tasks.cover = None;
                     self.cover.loading = false;
-                    if let Some(picker) = &self.picker {
+                    if let (Some(picker), Some(image)) = (&self.picker, image) {
                         self.cover.protocol = Some(picker.new_resize_protocol(*image));
                     }
                 }
             }
-            ApiMsg::HomeDone { result } => {
+            ApiMsg::HomeDone { seq, result } => {
+                if seq != self.home_seq {
+                    return;
+                }
                 self.home.loading = false;
                 match result {
                     Ok((tracks, albums)) => {
@@ -1123,80 +1538,163 @@ impl App {
                         self.home.albums = albums;
                         self.home.selected = 0;
                     }
-                    Err(e) => self.toast(format!("加载推荐失败: {e}")),
+                    Err(e) if self.main_view == MainView::Home => {
+                        self.toast(format!("加载推荐失败: {e}"));
+                    }
+                    Err(e) => tracing::warn!("home load failed in background: {e}"),
                 }
             }
-            ApiMsg::LibraryTracks { title, result } => {
+            ApiMsg::LibraryTracks { seq, title, result } => {
+                if seq != self.library_seq {
+                    return;
+                }
                 self.library.loading = false;
+                if self.main_view != MainView::Library {
+                    return;
+                }
                 match result {
-                    Ok(tracks) => self.push_browse(BrowsePage::Tracks {
-                        title,
-                        tracks,
-                        selected: 0,
-                    }),
-                    Err(e) => self.toast(format!("加载失败: {e}")),
+                    Ok(tracks) => {
+                        self.library.failed = false;
+                        self.push_browse(BrowsePage::Tracks {
+                            title,
+                            tracks,
+                            selected: 0,
+                        });
+                    }
+                    Err(e) => {
+                        self.library.failed = true;
+                        tracing::warn!("library tracks load failed: {e}");
+                        self.toast(format!("加载失败，按 Enter 重试: {e}"));
+                    }
                 }
             }
-            ApiMsg::LibraryPlaylists { result } => {
+            ApiMsg::LibraryPlaylists { seq, result } => {
+                if seq != self.library_seq {
+                    return;
+                }
                 self.library.loading = false;
+                if self.main_view != MainView::Library {
+                    return;
+                }
                 match result {
-                    Ok(items) => self.push_browse(BrowsePage::Playlists {
-                        title: "我的歌单".into(),
-                        items,
-                        selected: 0,
-                    }),
-                    Err(e) => self.toast(format!("加载失败: {e}")),
+                    Ok(items) => {
+                        self.library.failed = false;
+                        self.push_browse(BrowsePage::Playlists {
+                            title: "我的歌单".into(),
+                            items,
+                            selected: 0,
+                        });
+                    }
+                    Err(e) => {
+                        self.library.failed = true;
+                        tracing::warn!("library playlists load failed: {e}");
+                        self.toast(format!("加载失败，按 Enter 重试: {e}"));
+                    }
                 }
             }
-            ApiMsg::LibraryAlbums { result } => {
+            ApiMsg::LibraryAlbums { seq, result } => {
+                if seq != self.library_seq {
+                    return;
+                }
                 self.library.loading = false;
+                if self.main_view != MainView::Library {
+                    return;
+                }
                 match result {
-                    Ok(items) => self.push_browse(BrowsePage::Albums {
-                        title: "收藏的专辑".into(),
-                        items,
-                        selected: 0,
-                    }),
-                    Err(e) => self.toast(format!("加载失败: {e}")),
+                    Ok(items) => {
+                        self.library.failed = false;
+                        self.push_browse(BrowsePage::Albums {
+                            title: "收藏的专辑".into(),
+                            items,
+                            selected: 0,
+                        });
+                    }
+                    Err(e) => {
+                        self.library.failed = true;
+                        tracing::warn!("library albums load failed: {e}");
+                        self.toast(format!("加载失败，按 Enter 重试: {e}"));
+                    }
                 }
             }
-            ApiMsg::LibraryArtists { result } => {
+            ApiMsg::LibraryArtists { seq, result } => {
+                if seq != self.library_seq {
+                    return;
+                }
                 self.library.loading = false;
+                if self.main_view != MainView::Library {
+                    return;
+                }
                 match result {
-                    Ok(items) => self.push_browse(BrowsePage::Artists {
-                        title: "关注的歌手".into(),
-                        items,
-                        selected: 0,
-                    }),
-                    Err(e) => self.toast(format!("加载失败: {e}")),
+                    Ok(items) => {
+                        self.library.failed = false;
+                        self.push_browse(BrowsePage::Artists {
+                            title: "关注的歌手".into(),
+                            items,
+                            selected: 0,
+                        });
+                    }
+                    Err(e) => {
+                        self.library.failed = true;
+                        tracing::warn!("library artists load failed: {e}");
+                        self.toast(format!("加载失败，按 Enter 重试: {e}"));
+                    }
                 }
             }
-            ApiMsg::LoginDone { result } => {
+            ApiMsg::LoginDone { seq, result } => {
+                if seq != self.auth_seq {
+                    return;
+                }
                 self.library.loading = false;
                 self.login.busy = false;
                 match result {
                     Ok(()) => {
                         self.library.selected = 0;
-                        self.toast("登录成功 - Enter 打开音乐库");
+                        self.library.failed = false;
+                        if self.main_view == MainView::Library {
+                            self.toast("登录成功 - Enter 打开音乐库");
+                        }
                     }
                     // Multi-line hints render as one status line; keep the
                     // first line, which carries the actionable part.
                     Err(e) => {
                         let first = e.lines().next().unwrap_or(&e).to_string();
-                        self.toast(format!("登录失败: {first}"));
+                        if self.main_view == MainView::Library {
+                            self.toast(format!("登录失败: {first}"));
+                        } else {
+                            tracing::warn!("background login failed: {first}");
+                        }
                     }
                 }
             }
-            ApiMsg::LogoutDone { result } => match result {
-                Ok(()) => {
-                    self.login.selected = 0;
-                    self.toast("已退出登录");
+            ApiMsg::LogoutDone { seq, result } => {
+                if seq != self.auth_seq {
+                    return;
                 }
-                Err(e) => self.toast(format!("退出失败: {e}")),
-            },
+                self.login.busy = false;
+                self.library.loading = false;
+                match result {
+                    Ok(()) => {
+                        self.login.selected = 0;
+                        self.library.failed = false;
+                        self.library_seq = self.library_seq.wrapping_add(1);
+                        if self.main_view == MainView::Library {
+                            self.toast("已退出登录");
+                        }
+                    }
+                    Err(e) if self.main_view == MainView::Library => {
+                        self.toast(format!("退出失败: {e}"));
+                    }
+                    Err(e) => tracing::warn!("background logout failed: {e}"),
+                }
+            }
         }
     }
 
     fn push_browse(&mut self, page: BrowsePage) {
+        if self.main_view != MainView::Browse {
+            self.browse_stack.clear();
+            self.browse_root_view = self.main_view;
+        }
         self.browse_stack.push(page);
         self.main_view = MainView::Browse;
         self.focus = Focus::Main;
@@ -1205,12 +1703,25 @@ impl App {
     // ---------- key handling ----------
 
     fn on_key(&mut self, key: KeyEvent) {
+        if key.code != KeyCode::Enter {
+            self.detail_retry_hint = None;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
         }
         if self.help_visible {
-            self.help_visible = false;
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(30)
+                }
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10).min(30),
+                _ => self.help_visible = false,
+            }
             return;
         }
         if self.input.is_some() {
@@ -1245,7 +1756,10 @@ impl App {
                 self.focus = Focus::Main;
                 self.main_view = MainView::Library;
             }
-            Action::Help => self.help_visible = true,
+            Action::Help => {
+                self.help_visible = true;
+                self.help_scroll = 0;
+            }
             Action::FocusToggle => {
                 self.focus = match self.focus {
                     Focus::Main => Focus::Queue,
@@ -1276,6 +1790,9 @@ impl App {
             }
             Action::RadioToggle => {
                 self.radio_on = !self.radio_on;
+                if !self.radio_on {
+                    self.queue_seq = self.queue_seq.wrapping_add(1);
+                }
                 self.toast(if self.radio_on {
                     "电台续播: 开"
                 } else {
@@ -1293,10 +1810,12 @@ impl App {
                 } else {
                     self.prev_main_view = self.main_view;
                     self.main_view = MainView::NowPlaying;
+                    self.maybe_load_cover();
                 }
             }
             Action::RestartPlayer => {
                 if !self.pb.alive {
+                    self.restart_pending_track = self.current_video_id.is_some();
                     self.player_restart_requested = true;
                 }
             }
@@ -1337,8 +1856,15 @@ impl App {
     }
 
     fn submit_search(&mut self, query: String) {
+        for task in &mut self.search_tasks {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
         self.search.query = query;
         self.search.results = SearchResults::default();
+        self.search.loading = [false; 4];
+        self.search.errors = std::array::from_fn(|_| None);
         self.search.selected = 0;
         self.main_view = MainView::Search;
         self.focus = Focus::Main;
@@ -1347,17 +1873,30 @@ impl App {
     }
 
     fn submit_login(&mut self, input: String) {
+        if self.login.busy {
+            return;
+        }
+        self.login.busy = true;
         self.library.loading = true;
+        self.auth_seq = self.auth_seq.wrapping_add(1);
+        let seq = self.auth_seq;
         self.toast("正在验证登录..");
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = api.login_cookie(&input).await.map_err(|e| format!("{e:#}"));
-            let _ = tx.send(AppEvent::Api(ApiMsg::LoginDone { result }));
+            let result = api
+                .login_cookie(&input)
+                .await
+                .map_err(|_| "登录验证失败，请检查 Cookie 是否有效及网络连接".to_string());
+            let _ = tx.send(AppEvent::Api(ApiMsg::LoginDone { seq, result }));
         });
     }
 
     fn on_search_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('g') && self.search.errors[self.search.kind_idx].is_some() {
+            self.fire_kind_search();
+            return;
+        }
         let len = self.search.list_len();
         if nav_list(&mut self.search.selected, len, key.code) {
             return;
@@ -1438,11 +1977,7 @@ impl App {
 
     fn sync_view_after_pop(&mut self) {
         if self.browse_stack.is_empty() {
-            self.main_view = if self.search.query.is_empty() {
-                MainView::Home
-            } else {
-                MainView::Search
-            };
+            self.main_view = self.browse_root_view;
         }
     }
 
@@ -1457,7 +1992,11 @@ impl App {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Backspace => {
+                if let Some(task) = self.browse_task.take() {
+                    task.abort();
+                }
                 self.browse_stack.pop();
+                self.browse_seq = self.browse_seq.wrapping_add(1);
                 self.sync_view_after_pop();
             }
             KeyCode::Enter => self.activate_browse_selection(false),
@@ -1648,9 +2187,23 @@ impl App {
     // ---------- mouse ----------
 
     fn on_mouse(&mut self, me: MouseEvent) {
+        if matches!(
+            me.kind,
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            self.detail_retry_hint = None;
+        }
+        if self.input.is_some() {
+            return;
+        }
         if self.help_visible {
-            if matches!(me.kind, MouseEventKind::Down(_)) {
-                self.help_visible = false;
+            match me.kind {
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(3).min(30)
+                }
+                MouseEventKind::Down(_) => self.help_visible = false,
+                _ => {}
             }
             return;
         }
@@ -1686,6 +2239,7 @@ impl App {
             MainView::NowPlaying if self.main_view != MainView::NowPlaying => {
                 self.prev_main_view = self.main_view;
                 self.main_view = MainView::NowPlaying;
+                self.maybe_load_cover();
             }
             v => self.main_view = v,
         }
@@ -1714,13 +2268,14 @@ impl App {
             }
         }
 
-        // Search category tabs → approximate hit by even quarters.
-        if let Some(tabs) = layout.search_tabs {
-            if tabs.contains(pos) && self.main_view == MainView::Search {
-                let n = SearchKind::ALL.len() as u16;
-                let idx = ((x.saturating_sub(tabs.x)) * n / tabs.width.max(1)).min(n - 1);
-                if idx as usize != self.search.kind_idx {
-                    self.search.kind_idx = idx as usize;
+        // Search category tabs use their rendered widths for hit testing.
+        if self.main_view == MainView::Search {
+            for (idx, tab) in layout.search_tabs.iter().enumerate() {
+                if !tab.is_some_and(|area| area.contains(pos)) {
+                    continue;
+                }
+                if idx != self.search.kind_idx {
+                    self.search.kind_idx = idx;
                     self.search.selected = 0;
                     if self.search.list_len() == 0 {
                         self.fire_kind_search();
@@ -1794,6 +2349,14 @@ impl App {
                             }
                         }
                     }
+                    MainListKind::History => {
+                        if row < self.history.entries().len() {
+                            self.history_selected = row;
+                            if double {
+                                self.play_history_selection();
+                            }
+                        }
+                    }
                     MainListKind::Home => {
                         // Physical rows include the two section headers.
                         let t = self.home.tracks.len();
@@ -1857,6 +2420,10 @@ impl App {
                                 step(self.login.selected, self.login.methods.len());
                         }
                     }
+                    MainListKind::History => {
+                        self.history_selected =
+                            step(self.history_selected, self.history.entries().len());
+                    }
                     MainListKind::Home => {
                         self.home.selected = step(self.home.selected, self.home.row_count());
                     }
@@ -1876,20 +2443,23 @@ impl App {
     fn on_history_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.library.selected = self.library.selected.saturating_sub(1)
+                self.history_selected = self.history_selected.saturating_sub(1)
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.library.selected =
-                    (self.library.selected + 1).min(self.history.entries().len().saturating_sub(1));
+                self.history_selected =
+                    (self.history_selected + 1).min(self.history.entries().len().saturating_sub(1));
             }
-            KeyCode::Enter => {
-                if let Some(entry) = self.history.entries().get(self.library.selected) {
-                    self.queue.set_context(vec![entry.track.clone()], 0);
-                    self.start_track_at(0);
-                }
-            }
+            KeyCode::Enter => self.play_history_selection(),
             KeyCode::Esc => self.main_view = MainView::Home,
             _ => {}
+        }
+    }
+
+    fn play_history_selection(&mut self) {
+        if let Some(entry) = self.history.entries().get(self.history_selected) {
+            self.queue.set_context(vec![entry.track.clone()], 0);
+            self.queue_seq = self.queue_seq.wrapping_add(1);
+            self.start_track_at(0);
         }
     }
 
@@ -1915,11 +2485,18 @@ impl App {
             }
             KeyCode::Enter => self.open_library_item(self.library.selected),
             KeyCode::Char('x') => {
+                if self.login.busy {
+                    return;
+                }
+                self.login.busy = true;
+                self.library.loading = true;
+                self.auth_seq = self.auth_seq.wrapping_add(1);
+                let seq = self.auth_seq;
                 let api = self.api.clone();
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     let result = api.logout().await.map_err(|e| format!("{e}"));
-                    let _ = tx.send(AppEvent::Api(ApiMsg::LogoutDone { result }));
+                    let _ = tx.send(AppEvent::Api(ApiMsg::LogoutDone { seq, result }));
                 });
             }
             KeyCode::Esc => self.main_view = MainView::Home,
@@ -1946,28 +2523,29 @@ impl App {
             }
             LoginMethod::Browser { display, profile } => {
                 self.login.busy = true;
+                self.library.loading = true;
+                self.auth_seq = self.auth_seq.wrapping_add(1);
+                let seq = self.auth_seq;
                 self.toast(format!("正在从 {display} 读取登录信息.."));
                 let api = self.api.clone();
                 let tx = self.tx.clone();
-                let work_dir = self.data_dir.clone();
                 tokio::spawn(async move {
                     // The cookie text stays inside this task: read, handed to
                     // the API, then dropped. Never logged.
                     // Reading is blocking file I/O, so keep it off the async
                     // worker threads.
                     let read = tokio::task::spawn_blocking(move || {
-                        crate::browser_cookies::read_cookies(&profile, &work_dir)
+                        crate::browser_cookies::read_cookies(&profile)
                     })
                     .await;
                     let result = match read {
-                        Ok(Ok(cookies)) => api
-                            .login_cookie(&cookies)
-                            .await
-                            .map_err(|e| format!("{e:#}")),
+                        Ok(Ok(cookies)) => api.login_cookie(&cookies).await.map_err(|_| {
+                            "登录验证失败，请检查浏览器登录状态及网络连接".to_string()
+                        }),
                         Ok(Err(e)) => Err(format!("{e:#}")),
                         Err(e) => Err(format!("读取任务失败: {e}")),
                     };
-                    let _ = tx.send(AppEvent::Api(ApiMsg::LoginDone { result }));
+                    let _ = tx.send(AppEvent::Api(ApiMsg::LoginDone { seq, result }));
                 });
             }
         }
@@ -1978,6 +2556,9 @@ impl App {
             return;
         }
         self.library.loading = true;
+        self.library.failed = false;
+        self.library_seq = self.library_seq.wrapping_add(1);
+        let seq = self.library_seq;
         let api = self.api.clone();
         let tx = self.tx.clone();
         match index {
@@ -1985,6 +2566,7 @@ impl App {
                 tokio::spawn(async move {
                     let result = api.liked_tracks().await.map_err(|e| format!("{e}"));
                     let _ = tx.send(AppEvent::Api(ApiMsg::LibraryTracks {
+                        seq,
                         title: "喜欢的音乐".into(),
                         result,
                     }));
@@ -1993,25 +2575,26 @@ impl App {
             1 => {
                 tokio::spawn(async move {
                     let result = api.saved_playlists().await.map_err(|e| format!("{e}"));
-                    let _ = tx.send(AppEvent::Api(ApiMsg::LibraryPlaylists { result }));
+                    let _ = tx.send(AppEvent::Api(ApiMsg::LibraryPlaylists { seq, result }));
                 });
             }
             2 => {
                 tokio::spawn(async move {
                     let result = api.saved_albums().await.map_err(|e| format!("{e}"));
-                    let _ = tx.send(AppEvent::Api(ApiMsg::LibraryAlbums { result }));
+                    let _ = tx.send(AppEvent::Api(ApiMsg::LibraryAlbums { seq, result }));
                 });
             }
             3 => {
                 tokio::spawn(async move {
                     let result = api.saved_artists().await.map_err(|e| format!("{e}"));
-                    let _ = tx.send(AppEvent::Api(ApiMsg::LibraryArtists { result }));
+                    let _ = tx.send(AppEvent::Api(ApiMsg::LibraryArtists { seq, result }));
                 });
             }
             _ => {
                 tokio::spawn(async move {
                     let result = api.history().await.map_err(|e| format!("{e}"));
                     let _ = tx.send(AppEvent::Api(ApiMsg::LibraryTracks {
+                        seq,
                         title: "播放历史".into(),
                         result,
                     }));
@@ -2053,5 +2636,687 @@ impl App {
             KeyCode::Esc => self.focus = Focus::Main,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{bail, Result};
+    use ratatui::crossterm::event::KeyModifiers;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct TestApi;
+
+    #[async_trait::async_trait]
+    impl MusicApi for TestApi {
+        async fn search(&self, _: &str, _: SearchKind) -> Result<SearchResults> {
+            std::future::pending().await
+        }
+        async fn album(&self, _: &str) -> Result<AlbumDetail> {
+            std::future::pending().await
+        }
+        async fn artist(&self, _: &str) -> Result<ArtistDetail> {
+            bail!("unused")
+        }
+        async fn playlist(&self, _: &str) -> Result<PlaylistDetail> {
+            bail!("unused")
+        }
+        async fn radio(&self, _: &str) -> Result<Vec<Track>> {
+            std::future::pending().await
+        }
+        async fn stream_url(&self, _: &str, _: StreamFormat) -> Result<String> {
+            std::future::pending().await
+        }
+        async fn plain_lyrics(&self, _: &str) -> Result<Option<String>> {
+            bail!("unused")
+        }
+        async fn home(&self) -> Result<(Vec<Track>, Vec<AlbumSummary>)> {
+            bail!("unused")
+        }
+        fn is_logged_in(&self) -> bool {
+            false
+        }
+        async fn login_cookie(&self, _: &str) -> Result<()> {
+            bail!("unused")
+        }
+        async fn logout(&self) -> Result<()> {
+            bail!("unused")
+        }
+        async fn liked_tracks(&self) -> Result<Vec<Track>> {
+            bail!("unused")
+        }
+        async fn history(&self) -> Result<Vec<Track>> {
+            bail!("unused")
+        }
+        async fn saved_playlists(&self) -> Result<Vec<PlaylistSummary>> {
+            bail!("unused")
+        }
+        async fn saved_albums(&self) -> Result<Vec<AlbumSummary>> {
+            bail!("unused")
+        }
+        async fn saved_artists(&self) -> Result<Vec<ArtistSummary>> {
+            bail!("unused")
+        }
+    }
+
+    fn track(id: &str) -> Track {
+        Track {
+            video_id: id.into(),
+            title: id.into(),
+            artists: "artist".into(),
+            album: None,
+            duration_secs: Some(120),
+            cover_url: None,
+        }
+    }
+
+    fn test_app() -> (App, mpsc::UnboundedReceiver<PlayerCmd>) {
+        let (player, commands) = PlayerHandle::test_handle();
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.playback.radio_auto = false;
+        config.lyrics.enabled = false;
+        config.sponsorblock.enabled = false;
+        let app = App::new(
+            config,
+            player,
+            Arc::new(TestApi),
+            reqwest::Client::new(),
+            std::env::temp_dir(),
+            None,
+            tx,
+        );
+        (app, commands)
+    }
+
+    #[tokio::test]
+    async fn idle_tick_only_redraws_on_visible_change() {
+        let (mut app, _) = test_app();
+        assert!(!app.handle(AppEvent::Tick));
+
+        app.toast("temporary");
+        for _ in 0..11 {
+            assert!(!app.handle(AppEvent::Tick));
+        }
+        assert!(app.handle(AppEvent::Tick));
+        assert!(app.status.is_none());
+
+        app.pb.loading = true;
+        assert!(app.handle(AppEvent::Tick));
+        assert_eq!(app.pb.loading_secs, 0.25);
+    }
+
+    #[tokio::test]
+    async fn download_failure_re_resolves_with_bounded_attempts_and_position() {
+        let (mut app, _) = test_app();
+        app.current_video_id = Some("song".into());
+        app.pb.loading = false;
+        app.pb.time_pos = 42.0;
+        app.load_requested = true;
+        app.on_track_event(TrackEvent::LoadFailed("音频下载失败: HTTP 403".into()));
+        assert_eq!(app.stream_attempt, 1);
+        assert!(app.pb.loading);
+        assert_eq!(app.resume_position, Some(42.0));
+
+        app.load_requested = true;
+        app.on_track_event(TrackEvent::LoadFailed("音频下载失败: HTTP 403".into()));
+        assert_eq!(app.stream_attempt, 2);
+        app.load_requested = true;
+        app.on_track_event(TrackEvent::LoadFailed("音频下载失败: HTTP 403".into()));
+        assert!(!app.pb.loading);
+    }
+
+    #[tokio::test]
+    async fn failed_search_keeps_retry_state_for_current_category() {
+        let (mut app, _) = test_app();
+        app.search.query = "test".into();
+        app.main_view = MainView::Search;
+        app.on_api_msg(ApiMsg::SearchDone {
+            seq: app.search_seq,
+            kind: SearchKind::Songs,
+            result: Err("offline".into()),
+        });
+        assert_eq!(app.search.errors[0].as_deref(), Some("offline"));
+        app.on_search_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(app.search.loading[0]);
+        assert!(app.search.errors[0].is_none());
+    }
+
+    #[test]
+    fn conflicting_key_overrides_keep_essential_navigation() {
+        let overrides = HashMap::from([
+            ("next".to_string(), "j".to_string()),
+            ("prev".to_string(), "q".to_string()),
+        ]);
+        let map = build_keymap(&overrides);
+        assert_eq!(map.get(&KeyCode::Char('j')), None);
+        assert_eq!(map.get(&KeyCode::Char('q')), Some(&Action::Quit));
+        assert_eq!(map.get(&KeyCode::Char('n')), Some(&Action::NextTrack));
+        assert_eq!(map.get(&KeyCode::Char('p')), Some(&Action::PrevTrack));
+    }
+
+    #[tokio::test]
+    async fn old_resolution_cannot_replace_replayed_same_video() {
+        let (mut app, mut commands) = test_app();
+        app.play_context(vec![track("a")], 0);
+        let old_seq = app.play_seq;
+        app.play_context(vec![track("b")], 0);
+        app.play_context(vec![track("a")], 0);
+        app.on_api_msg(ApiMsg::StreamResolved {
+            play_seq: old_seq,
+            video_id: "a".into(),
+            attempt: 0,
+            result: Ok("https://example.com/old".into()),
+        });
+        assert!(!app.load_requested);
+        while let Ok(command) = commands.try_recv() {
+            assert!(!matches!(command, PlayerCmd::Load { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn old_time_updates_do_not_move_new_loading_track() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("a")], 0);
+        app.pb.time_pos = 55.0;
+        app.play_context(vec![track("b")], 0);
+        app.on_player_event(PlayerEvent::Track {
+            play_seq: app.play_seq - 1,
+            event: TrackEvent::TimePos(56.0),
+        });
+        app.on_player_event(PlayerEvent::Track {
+            play_seq: app.play_seq - 1,
+            event: TrackEvent::Duration(999.0),
+        });
+        assert_eq!(app.pb.time_pos, 0.0);
+        assert_eq!(app.pb.duration, 120.0);
+    }
+
+    #[tokio::test]
+    async fn old_player_load_end_and_failure_events_cannot_change_new_track() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("a"), track("b")], 0);
+        let old_seq = app.play_seq;
+        app.start_track_at(1);
+        app.load_requested = true;
+        for event in [
+            TrackEvent::FileLoaded,
+            TrackEvent::LoadFailed("old failure".into()),
+            TrackEvent::TrackEnded,
+        ] {
+            app.on_player_event(PlayerEvent::Track {
+                play_seq: old_seq,
+                event,
+            });
+        }
+        assert!(app.load_requested);
+        assert!(app.pb.loading);
+        assert_eq!(app.current_video_id.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn changing_tracks_cancels_old_stream_resolution() {
+        let (mut app, _) = test_app();
+        app.start_track(track("first"));
+        let old_task = app.track_tasks.stream.as_ref().unwrap().abort_handle();
+        app.start_track(track("second"));
+        tokio::task::yield_now().await;
+        assert!(old_task.is_finished());
+        assert_eq!(app.current_video_id.as_deref(), Some("second"));
+
+        let current_task = app.track_tasks.stream.as_ref().unwrap().abort_handle();
+        app.stop_playback_ui();
+        tokio::task::yield_now().await;
+        assert!(current_task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn new_search_and_leaving_browse_cancel_old_page_requests() {
+        let (mut app, _) = test_app();
+        app.submit_search("first".into());
+        let old_search = app.search_tasks[0].as_ref().unwrap().abort_handle();
+        app.submit_search("second".into());
+        tokio::task::yield_now().await;
+        assert!(old_search.is_finished());
+        assert_eq!(app.search.query, "second");
+
+        app.open_album("album".into(), "Album".into());
+        let old_browse = app.browse_task.as_ref().unwrap().abort_handle();
+        app.on_browse_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+        assert!(old_browse.is_finished());
+        assert!(app.browse_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn browse_returns_to_the_page_that_opened_it() {
+        let (mut app, _) = test_app();
+        app.search.query = "old search".into();
+        app.main_view = MainView::Home;
+        app.open_album("album".into(), "Album".into());
+        app.on_browse_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.main_view, MainView::Home);
+
+        app.main_view = MainView::Library;
+        app.push_browse(BrowsePage::Tracks {
+            title: "喜欢的音乐".into(),
+            tracks: vec![track("liked")],
+            selected: 0,
+        });
+        assert_eq!(app.browse_stack.len(), 1);
+        app.on_browse_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.main_view, MainView::Library);
+
+        app.main_view = MainView::Search;
+        app.open_album("old".into(), "Old".into());
+        app.main_view = MainView::Library;
+        app.push_browse(BrowsePage::Tracks {
+            title: "新列表".into(),
+            tracks: vec![track("new")],
+            selected: 0,
+        });
+        assert_eq!(app.browse_stack.len(), 1);
+        app.on_browse_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.main_view, MainView::Library);
+    }
+
+    #[tokio::test]
+    async fn failed_detail_keeps_retry_hint_after_toast_expires() {
+        let (mut app, _) = test_app();
+        app.main_view = MainView::Search;
+        app.search.query = "album".into();
+        app.open_album("missing".into(), "Missing".into());
+        let seq = app.browse_seq;
+        app.on_api_msg(ApiMsg::AlbumDone {
+            seq,
+            result: Err("offline".into()),
+        });
+        assert_eq!(app.main_view, MainView::Search);
+        assert!(app.detail_retry_hint.is_some());
+        for _ in 0..12 {
+            app.handle(AppEvent::Tick);
+        }
+        assert!(app.status.is_none());
+        assert!(app.detail_retry_hint.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.detail_retry_hint.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires YTBM_TEST_AAC_FIXTURE, loopback TCP and an audio device"]
+    async fn real_player_recovers_from_second_range_403() {
+        const RANGE: usize = 1024 * 1024;
+        let fixture = std::env::var("YTBM_TEST_AAC_FIXTURE").expect("set YTBM_TEST_AAC_FIXTURE");
+        let mut body = std::fs::read(fixture).unwrap();
+        let free_size = (RANGE + 1).saturating_sub(body.len()).max(8);
+        body.extend_from_slice(&(free_size as u32).to_be_bytes());
+        body.extend_from_slice(b"free");
+        body.resize(body.len() + free_size - 8, 0);
+        assert_eq!(body.len(), RANGE + 1);
+        let body = Arc::new(body);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let Ok(size) = socket.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..size]);
+                    let bad = request.starts_with("GET /bad ");
+                    let start = request
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("range")
+                                    .then(|| value.trim().strip_prefix("bytes="))
+                                    .flatten()
+                            })
+                        })
+                        .and_then(|range| range.split_once('-'))
+                        .and_then(|(start, _)| start.parse::<usize>().ok())
+                        .unwrap();
+                    if bad && start >= RANGE {
+                        let _ = socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let end = (start + RANGE).min(body.len()) - 1;
+                    let bytes = &body[start..=end];
+                    let header = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len(), bytes.len()
+                    );
+                    if socket.write_all(header.as_bytes()).await.is_ok() {
+                        let _ = socket.write_all(bytes).await;
+                    }
+                });
+            }
+        });
+
+        let (player_tx, mut player_rx) = mpsc::unbounded_channel();
+        let player = crate::player::spawn_native_player(0, player_tx);
+        let (app_tx, _) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.playback.engine = PlaybackEngine::Native;
+        config.playback.radio_auto = false;
+        config.lyrics.enabled = false;
+        config.sponsorblock.enabled = false;
+        let mut app = App::new(
+            config,
+            player.clone(),
+            Arc::new(TestApi),
+            reqwest::Client::new(),
+            std::env::temp_dir(),
+            None,
+            app_tx,
+        );
+        let ready = tokio::time::timeout(Duration::from_secs(5), player_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ready, PlayerEvent::Ready), "{ready:?}");
+        app.on_player_event(ready);
+        app.play_context(vec![track("fixture")], 0);
+        app.track_tasks.stream.take().unwrap().abort();
+        app.on_api_msg(ApiMsg::StreamResolved {
+            play_seq: app.play_seq,
+            video_id: "fixture".into(),
+            attempt: 0,
+            result: Ok(format!("{origin}/bad")),
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = player_rx.recv().await.expect("player channel closed");
+                let failed = matches!(
+                    &event,
+                    PlayerEvent::Track {
+                        event: TrackEvent::LoadFailed(error),
+                        ..
+                    } if error.contains("403")
+                );
+                app.on_player_event(event);
+                if failed {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("second-range 403 did not reach the app");
+        assert_eq!(app.stream_attempt, 1);
+        assert!(app.pb.loading);
+
+        app.track_tasks.stream.take().unwrap().abort();
+        app.on_api_msg(ApiMsg::StreamResolved {
+            play_seq: app.play_seq,
+            video_id: "fixture".into(),
+            attempt: 1,
+            result: Ok(format!("{origin}/good")),
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = player_rx.recv().await.expect("player channel closed");
+                let loaded = matches!(
+                    event,
+                    PlayerEvent::Track {
+                        event: TrackEvent::FileLoaded,
+                        ..
+                    }
+                );
+                app.on_player_event(event);
+                if loaded {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("good replacement stream did not load");
+        assert!(!app.pb.loading);
+        assert_eq!(app.stream_attempt, 1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                app.on_player_event(player_rx.recv().await.expect("player channel closed"));
+                if app.pb.time_pos > 0.5 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("replacement stream did not keep playing");
+        player.send(PlayerCmd::Shutdown);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn virtualized_home_click_uses_physical_row_offset() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, _) = test_app();
+        app.home.tracks = (0..100).map(|i| track(&format!("h{i}"))).collect();
+        app.home.selected = 90;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let layout = crate::ui::draw(f, &mut app);
+                app.ui_layout = layout;
+            })
+            .unwrap();
+        let (_, area, offset) = app.ui_layout.main_list.unwrap();
+        assert!(offset > 1);
+        app.on_click(area.x, area.y);
+        assert_eq!(app.home.selected, offset - 1);
+    }
+
+    #[tokio::test]
+    async fn virtualized_search_click_uses_row_offset() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, _) = test_app();
+        app.main_view = MainView::Search;
+        app.search.query = "many".into();
+        app.search.results.tracks = (0..1000).map(|i| track(&format!("s{i}"))).collect();
+        app.search.selected = 900;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let layout = crate::ui::draw(f, &mut app);
+                app.ui_layout = layout;
+            })
+            .unwrap();
+        let (_, area, offset) = app.ui_layout.main_list.unwrap();
+        assert!(offset > 1);
+        app.on_click(area.x, area.y + 1);
+        assert_eq!(app.search.selected, offset + 1);
+    }
+
+    #[tokio::test]
+    async fn common_pages_render_at_small_standard_and_wide_sizes() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, _) = test_app();
+        app.home.tracks = (0..40).map(|i| track(&format!("h{i}"))).collect();
+        app.search.query = "query".into();
+        app.search.results.tracks = (0..40).map(|i| track(&format!("s{i}"))).collect();
+        for (width, height) in [(40, 12), (80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for view in [MainView::Home, MainView::Search, MainView::NowPlaying] {
+                app.main_view = view;
+                app.focus = Focus::Queue;
+                terminal
+                    .draw(|f| {
+                        let layout = crate::ui::draw(f, &mut app);
+                        app.ui_layout = layout;
+                    })
+                    .unwrap();
+                if width < 84 || view == MainView::NowPlaying {
+                    assert_eq!(app.focus, Focus::Main);
+                    assert!(app.ui_layout.queue_pane.is_none());
+                }
+                if let Some((_, area, _)) = app.ui_layout.main_list {
+                    assert!(area.right() <= width && area.bottom() <= height);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_home_and_auth_results_leave_newer_state_untouched() {
+        let (mut app, _) = test_app();
+        app.home_seq = 2;
+        app.home.loading = true;
+        app.home.tracks.push(track("current"));
+        app.on_api_msg(ApiMsg::HomeDone {
+            seq: 1,
+            result: Ok((vec![track("old")], Vec::new())),
+        });
+        assert!(app.home.loading);
+        assert_eq!(app.home.tracks[0].video_id, "current");
+
+        app.auth_seq = 2;
+        app.login.busy = true;
+        app.library.loading = true;
+        app.on_api_msg(ApiMsg::LoginDone {
+            seq: 1,
+            result: Ok(()),
+        });
+        app.on_api_msg(ApiMsg::LogoutDone {
+            seq: 1,
+            result: Ok(()),
+        });
+        assert!(app.login.busy);
+        assert!(app.library.loading);
+    }
+
+    #[tokio::test]
+    async fn library_failure_keeps_selected_item_and_retry_state() {
+        let (mut app, _) = test_app();
+        app.main_view = MainView::Library;
+        app.library.selected = 2;
+        app.library.loading = true;
+        app.library_seq = 1;
+        app.on_api_msg(ApiMsg::LibraryAlbums {
+            seq: 1,
+            result: Err("offline".into()),
+        });
+        assert_eq!(app.main_view, MainView::Library);
+        assert_eq!(app.library.selected, 2);
+        assert!(!app.library.loading);
+        assert!(app.library.failed);
+
+        app.open_library_item(app.library.selected);
+        assert!(app.library.loading);
+        assert!(!app.library.failed);
+    }
+
+    #[tokio::test]
+    async fn login_requests_are_serialized() {
+        let (mut app, _) = test_app();
+        app.submit_login("first".into());
+        let seq = app.auth_seq;
+        app.submit_login("second".into());
+        assert!(app.login.busy);
+        assert_eq!(app.auth_seq, seq);
+    }
+
+    #[tokio::test]
+    async fn old_radio_result_cannot_extend_new_queue() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("a")], 0);
+        let old_seq = app.queue_seq;
+        app.play_context(vec![track("b")], 0);
+        app.on_api_msg(ApiMsg::RadioDone {
+            queue_seq: old_seq,
+            seed: "a".into(),
+            result: Ok(vec![track("unexpected")]),
+        });
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue.track_at(0).unwrap().video_id, "b");
+    }
+
+    #[tokio::test]
+    async fn next_on_last_track_stops_audio() {
+        let (mut app, mut commands) = test_app();
+        app.play_context(vec![track("a")], 0);
+        let advance = app.queue.next_manual();
+        app.advance(advance);
+        assert!(app.pb.current_title.is_none());
+        let stops = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter(|cmd| matches!(cmd, PlayerCmd::Stop))
+            .count();
+        assert_eq!(stops, 2);
+    }
+
+    #[tokio::test]
+    async fn restored_position_is_applied_on_first_play() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut commands) = test_app();
+        app.data_dir = dir.path().to_path_buf();
+        let saved = crate::session::SavedSession {
+            tracks: vec![track("resume")],
+            current: Some(0),
+            position: 42.0,
+            repeat: crate::player::queue::RepeatMode::Off,
+            radio_on: false,
+        };
+        saved.save(&app.session_path()).unwrap();
+        app.restore_session();
+        app.start_track_at(0);
+        assert_eq!(app.resume_position, Some(42.0));
+        app.load_requested = true;
+        app.on_player_event(PlayerEvent::Track {
+            play_seq: app.play_seq,
+            event: TrackEvent::FileLoaded,
+        });
+        let commands: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(commands
+            .iter()
+            .any(|cmd| matches!(cmd, PlayerCmd::SeekAbs(p) if *p == 42.0)));
+    }
+
+    #[tokio::test]
+    async fn player_restart_reloads_current_track_at_previous_position() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("a")], 0);
+        app.pb.alive = false;
+        app.pb.time_pos = 52.0;
+        app.restart_pending_track = true;
+        let old_seq = app.play_seq;
+        app.on_player_event(PlayerEvent::Ready);
+        assert!(app.pb.alive);
+        assert!(app.play_seq > old_seq);
+        assert_eq!(app.resume_position, Some(52.0));
+    }
+
+    #[tokio::test]
+    async fn player_init_failure_clears_loading_indicator() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("a")], 0);
+        app.on_player_event(PlayerEvent::InitFailed("no device".into()));
+        assert!(!app.pb.alive);
+        assert!(!app.pb.loading);
+        assert!(!app.load_requested);
+    }
+
+    #[tokio::test]
+    async fn leaving_loading_album_keeps_parent_on_late_error() {
+        let (mut app, _) = test_app();
+        app.browse_stack.push(BrowsePage::Albums {
+            title: "parent".into(),
+            items: Vec::new(),
+            selected: 0,
+        });
+        app.main_view = MainView::Browse;
+        app.browse_root_view = MainView::Library;
+        app.open_album("album-a".into(), "A".into());
+        let old_seq = app.browse_seq;
+        app.on_browse_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_api_msg(ApiMsg::AlbumDone {
+            seq: old_seq,
+            result: Err("late error".into()),
+        });
+        assert_eq!(app.browse_stack.len(), 1);
+        assert!(matches!(app.browse_stack[0], BrowsePage::Albums { .. }));
     }
 }

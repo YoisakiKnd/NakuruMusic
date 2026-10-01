@@ -15,6 +15,12 @@ use models::{
     SearchKind, SearchResults, Track,
 };
 
+#[derive(Debug, Clone, Copy)]
+pub enum StreamFormat {
+    Best,
+    Mp4Aac,
+}
+
 #[async_trait]
 pub trait MusicApi: Send + Sync {
     async fn search(&self, query: &str, kind: SearchKind) -> Result<SearchResults>;
@@ -28,7 +34,7 @@ pub trait MusicApi: Send + Sync {
     /// Doing this in-process replaces mpv's yt-dlp hook, which in turn needs
     /// an external JS runtime (deno/node) for YouTube's challenges.
     /// The returned URL is short-lived - resolve it right before playback.
-    async fn stream_url(&self, video_id: &str) -> Result<String>;
+    async fn stream_url(&self, video_id: &str, format: StreamFormat) -> Result<String>;
     /// Plain-text lyrics from YT Music (fallback source; LRCLIB is primary).
     async fn plain_lyrics(&self, video_id: &str) -> Result<Option<String>>;
 

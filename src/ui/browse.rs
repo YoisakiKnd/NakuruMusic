@@ -7,7 +7,9 @@ use ratatui::Frame;
 use crate::api::models::Track;
 use crate::app::{App, BrowsePage};
 
-use super::{badge, fit_w, track_item, truncate_w, BadgeKind, TrackCols, ACCENT, BADGE_W, DIM};
+use super::{
+    badge, fit_w, track_item, truncate_w, visible_start, BadgeKind, TrackCols, ACCENT, BADGE_W, DIM,
+};
 
 /// Returns the list hit area + scroll offset for mouse support.
 pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
@@ -77,23 +79,29 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
             draw_head(f, head_a, &format!("歌手  {name}"), &sub);
             if let Some(d) = data {
                 let cols = TrackCols::new(list_a.width);
-                let mut items: Vec<ListItem> = Vec::new();
-                for t in &d.top_tracks {
-                    items.push(track_item(t, cols));
-                }
-                for a in &d.albums {
-                    let year = a.year.map(|y| format!("{y}")).unwrap_or_default();
-                    items.push(ListItem::new(Line::from(vec![
-                        badge(BadgeKind::Album),
-                        Span::raw(fit_w(&a.title, cols.title.saturating_sub(BADGE_W))),
-                        Span::styled(
-                            format!(" {:width$}", "", width = cols.artist),
-                            Style::default().fg(DIM),
-                        ),
-                        Span::styled(format!(" {year:>5}"), Style::default().fg(DIM)),
-                    ])));
-                }
-                hit = render_list(f, list_a, items, *selected);
+                let items =
+                    d.top_tracks
+                        .iter()
+                        .map(|t| track_item(t, cols))
+                        .chain(d.albums.iter().map(|a| {
+                            let year = a.year.map(|y| format!("{y}")).unwrap_or_default();
+                            ListItem::new(Line::from(vec![
+                                badge(BadgeKind::Album),
+                                Span::raw(fit_w(&a.title, cols.title.saturating_sub(BADGE_W))),
+                                Span::styled(
+                                    format!(" {:width$}", "", width = cols.artist),
+                                    Style::default().fg(DIM),
+                                ),
+                                Span::styled(format!(" {year:>5}"), Style::default().fg(DIM)),
+                            ]))
+                        }));
+                hit = render_list(
+                    f,
+                    list_a,
+                    d.top_tracks.len() + d.albums.len(),
+                    items,
+                    *selected,
+                );
             }
         }
         BrowsePage::Tracks {
@@ -111,22 +119,19 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
         } => {
             draw_head(f, head_a, title, &format!("{} 张专辑", items.len()));
             let cols = TrackCols::new(list_a.width);
-            let rows: Vec<ListItem> = items
-                .iter()
-                .map(|a| {
-                    let year = a.year.map(|y| format!("{y}")).unwrap_or_default();
-                    ListItem::new(Line::from(vec![
-                        badge(BadgeKind::Album),
-                        Span::raw(fit_w(&a.title, cols.title.saturating_sub(BADGE_W))),
-                        Span::styled(
-                            format!(" {}", fit_w(&a.artists, cols.artist)),
-                            Style::default().fg(DIM),
-                        ),
-                        Span::styled(format!(" {year:>5}"), Style::default().fg(DIM)),
-                    ]))
-                })
-                .collect();
-            hit = render_list(f, list_a, rows, *selected);
+            let rows = items.iter().map(|a| {
+                let year = a.year.map(|y| format!("{y}")).unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    badge(BadgeKind::Album),
+                    Span::raw(fit_w(&a.title, cols.title.saturating_sub(BADGE_W))),
+                    Span::styled(
+                        format!(" {}", fit_w(&a.artists, cols.artist)),
+                        Style::default().fg(DIM),
+                    ),
+                    Span::styled(format!(" {year:>5}"), Style::default().fg(DIM)),
+                ]))
+            });
+            hit = render_list(f, list_a, items.len(), rows, *selected);
         }
         BrowsePage::Artists {
             title,
@@ -135,16 +140,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
         } => {
             draw_head(f, head_a, title, &format!("{} 位歌手", items.len()));
             let w = (list_a.width as usize).saturating_sub(BADGE_W + 2);
-            let rows: Vec<ListItem> = items
-                .iter()
-                .map(|a| {
-                    ListItem::new(Line::from(vec![
-                        badge(BadgeKind::Artist),
-                        Span::raw(truncate_w(&a.name, w)),
-                    ]))
-                })
-                .collect();
-            hit = render_list(f, list_a, rows, *selected);
+            let rows = items.iter().map(|a| {
+                ListItem::new(Line::from(vec![
+                    badge(BadgeKind::Artist),
+                    Span::raw(truncate_w(&a.name, w)),
+                ]))
+            });
+            hit = render_list(f, list_a, items.len(), rows, *selected);
         }
         BrowsePage::Playlists {
             title,
@@ -153,21 +155,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
         } => {
             draw_head(f, head_a, title, &format!("{} 个歌单", items.len()));
             let cols = TrackCols::new(list_a.width);
-            let rows: Vec<ListItem> = items
-                .iter()
-                .map(|p| {
-                    let count = p.track_count.map(|n| format!("{n} 首")).unwrap_or_default();
-                    ListItem::new(Line::from(vec![
-                        badge(BadgeKind::Playlist),
-                        Span::raw(fit_w(&p.title, cols.title.saturating_sub(BADGE_W))),
-                        Span::styled(
-                            format!(" {count:>width$}", width = cols.artist),
-                            Style::default().fg(DIM),
-                        ),
-                    ]))
-                })
-                .collect();
-            hit = render_list(f, list_a, rows, *selected);
+            let rows = items.iter().map(|p| {
+                let count = p.track_count.map(|n| format!("{n} 首")).unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    badge(BadgeKind::Playlist),
+                    Span::raw(fit_w(&p.title, cols.title.saturating_sub(BADGE_W))),
+                    Span::styled(
+                        format!(" {count:>width$}", width = cols.artist),
+                        Style::default().fg(DIM),
+                    ),
+                ]))
+            });
+            hit = render_list(f, list_a, items.len(), rows, *selected);
         }
     }
     hit
@@ -191,24 +190,28 @@ fn draw_track_list(
     selected: usize,
 ) -> Option<(Rect, usize)> {
     let cols = TrackCols::new(area.width);
-    let items: Vec<ListItem> = tracks.iter().map(|t| track_item(t, cols)).collect();
-    render_list(f, area, items, selected)
+    let items = tracks.iter().map(|t| track_item(t, cols));
+    render_list(f, area, tracks.len(), items, selected)
 }
 
 fn render_list(
     f: &mut Frame,
     area: Rect,
-    items: Vec<ListItem>,
+    len: usize,
+    items: impl Iterator<Item = ListItem<'static>>,
     selected: usize,
 ) -> Option<(Rect, usize)> {
-    if items.is_empty() {
+    if len == 0 {
         f.render_widget(
             Paragraph::new("（无内容）").style(Style::default().fg(DIM)),
             area,
         );
         return None;
     }
-    let list = List::new(items)
+    let selected = selected.min(len - 1);
+    let start = visible_start(len, selected, area.height);
+    let visible: Vec<_> = items.skip(start).take(area.height as usize).collect();
+    let list = List::new(visible)
         .highlight_style(
             Style::default()
                 .fg(ACCENT)
@@ -216,7 +219,7 @@ fn render_list(
         )
         .highlight_symbol("> ");
     let mut state = ListState::default();
-    state.select(Some(selected));
+    state.select(Some(selected - start));
     f.render_stateful_widget(list, area, &mut state);
-    Some((area, state.offset()))
+    Some((area, start))
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
@@ -46,14 +46,24 @@ pub fn parse_key(s: &str) -> Option<ratatui::crossterm::event::KeyCode> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Playback {
+    pub engine: PlaybackEngine,
     pub mpv_path: String,
     pub volume: i64,
     pub radio_auto: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackEngine {
+    #[default]
+    Mpv,
+    Native,
+}
+
 impl Default for Playback {
     fn default() -> Self {
         Self {
+            engine: PlaybackEngine::Mpv,
             mpv_path: "mpv".into(),
             volume: 70,
             radio_auto: true,
@@ -167,10 +177,36 @@ pub fn probe_version(exe: &str) -> bool {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    matches!(cmd.status(), Ok(s) if s.success())
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < std::time::Duration::from_secs(2) => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 pub fn project_dirs() -> Result<Dirs> {
+    if let Some(root) = std::env::var_os("YTBM_DATA_ROOT").filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            bail!("YTBM_DATA_ROOT 必须是绝对路径");
+        }
+        return Ok(Dirs {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+        });
+    }
     let pd = ProjectDirs::from("", "", "ytbm-tui")
         .context("cannot determine platform config directory")?;
     Ok(Dirs {
@@ -198,6 +234,7 @@ pub fn load(dirs: &Dirs) -> Result<Config> {
 const DEFAULT_CONFIG_TOML: &str = r#"# ytbm-tui 配置文件
 
 [playback]
+engine = "mpv"      # "native" 使用内置 AAC 播放器，无需 mpv；跨平台兼容性仍在验证
 mpv_path = "mpv"     # mpv 不在 PATH 时可写绝对路径
 volume = 70
 radio_auto = true    # 队列快播完时自动补充电台歌曲
@@ -218,3 +255,21 @@ enabled = true
 # next = "b"
 # play_pause = "space"
 "#;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn hung_tool_probe_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hung-tool");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!probe_version(script.to_str().unwrap()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
+}

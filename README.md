@@ -4,8 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/YoisakiKnd/ytbm-tui)](https://github.com/YoisakiKnd/ytbm-tui/releases/latest)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
-轻量级 YouTube Music 终端客户端（TUI）。单个可执行文件，运行内存 ~15MB，
-替代内存动辄数百 MB 的官方 Electron/浏览器方案。
+轻量级 YouTube Music 终端客户端（TUI）。可使用内置音频后端或 mpv 播放。
 
 ```
  首页 Esc  搜索 /  音乐库 L  历史 H  正在播放 l       ? 帮助  q 退出
@@ -46,17 +45,26 @@
 
 ## 安装
 
-只依赖一个外部程序——mpv（音频引擎），scoop 或 winget 任选：
+下载对应平台压缩包，解压后运行。首次启动会生成配置文件。当前默认使用 mpv，
+可通过 scoop 或 winget 安装：
 
 ```powershell
 scoop install mpv
 ```
 
+不安装 mpv 时，可在配置文件的 `[playback]` 下设置 `engine = "native"`，
+试用内置 MP4/AAC 播放器。这个模式先预缓冲约 1 MiB 压缩音频，
+再从匿名临时文件边下载边解码；单曲临时文件上限为 512 MiB。
+网络慢时播放会等待后续数据；快进到尚未下载的位置会取消当前分段并优先请求目标分段，仍需等待网络响应。切歌或退出后
+临时文件会关闭并删除。对带完整片段索引的 MP4，三小时线上 AAC 已实测快速启动、跳到两小时处及跳回开头；
+已在多首真实歌曲上完成整曲下载和 AAC 解码，也在 macOS 真实设备完成播放控制、两首线上歌曲连续自然结束及两小时本地 AAC 连续播放测试。
+部分地址仍会偶发 HTTP 403，程序会限次重新解析地址；跨平台验收和更多长音频封装测试仍在进行。
+
 > 播放地址由程序自己解析，不需要 yt-dlp，也不需要 yt-dlp 所要求的
 > JS 运行时（deno / node）。
 >
-> yt-dlp 是**可选**的：仅在程序自身解析播放地址失败时作为 mpv 的兜底。
-> 不装也能正常听歌和导入浏览器登录；若 Chromium 因加密限制无法导入，改用
+> yt-dlp 是**可选**的：仅在 mpv 模式下程序自身解析播放地址失败时作为兜底。
+> 浏览器登录导入不依赖 yt-dlp；若 Chromium 因加密限制无法导入，改用
 > Firefox 或手动粘贴 Cookie。
 >
 > 程序会自动在 PATH、scoop、Program Files 中寻找 mpv，装完不必重开终端。
@@ -80,12 +88,15 @@ CI（`.github/workflows/ci.yml`）在三大平台跑 fmt + clippy + test + relea
 推送 `v*` 标签会触发 `release.yml` 交叉构建四个平台产物并自动创建 GitHub Release。
 项目约定见 [CLAUDE.md](CLAUDE.md)。
 
+实机测试时可设置 `YTBM_DATA_ROOT` 为绝对路径，将配置、缓存和会话文件写入该目录，
+便于使用独立测试资料且不改动日常使用的配置。
+
 ## 登录（访问个人音乐库）
 
 按 `L` 打开登录页，程序会自动列出本机已安装的浏览器：
 
 ```
-[导入] 从 Firefox 导入登录
+[导入] 从 Firefox / Waterfox 导入登录
 [导入] 从 Vivaldi (…\persist\vivaldi\User Data) 导入登录
 [网页] 先在浏览器登录 music.youtube.com（打开网页）
 [手动] 手动粘贴 Cookie 或 cookies.txt 路径
@@ -96,7 +107,7 @@ CI（`.github/workflows/ci.yml`）在三大平台跑 fmt + clippy + test + relea
 先选「打开网页」登录，回来再导入。
 
 失败时的常见原因：**Chrome 127+ 启用了 App-Bound Encryption，把密钥绑定到
-Chrome 自身进程，外部程序无法解密**。Firefox 的 Cookie 库是明文的，可以正常导入。
+Chrome 自身进程，外部程序无法解密**。Firefox 和 Waterfox 的 Cookie 库是明文的，可以正常导入。
 读不出来就用「手动粘贴」兜底（浏览器扩展「Get cookies.txt LOCALLY」
 导出后粘贴文件路径即可）。
 
@@ -141,6 +152,7 @@ Chrome 自身进程，外部程序无法解密**。Firefox 的 Cookie 库是明�
 
 ```toml
 [playback]
+engine = "mpv"       # "native" 使用进程内 AAC 播放器，跨平台验收仍在进行
 mpv_path = "mpv"     # 自动发现失败时可写绝对路径
 volume = 70
 radio_auto = true
@@ -162,8 +174,8 @@ enabled = true
 
 ## 故障排查
 
-- **播放一直"解析中"**：多半是 yt-dlp 过旧或网络不通 YouTube，
-  运行 `scoop update yt-dlp`（或 `winget upgrade yt-dlp`）；播放条会显示已等待秒数
+- **播放一直"解析中"**：检查网络是否可访问 YouTube；内置模式可能正在等待预缓冲或音频元数据
+- **播放中断或无法播放**：可按 `R` 重启播放器并重试；若某首歌曲持续失败，记录曲目 ID 与日志，参见 [更新计划](UPDATE_PLAN.md) 的线上整曲验收状态
 - **yt-dlp 警告缺少 JS 运行时**：安装 deno，或已有 node 时在 `yt-dlp.conf`
   中加一行 `--js-runtimes node`
 - **提示未检测到 mpv**：`scoop install mpv`；程序会自动搜 scoop/winget 安装位置
@@ -175,7 +187,7 @@ enabled = true
 ## 合规说明
 
 本项目为个人学习/研究用途，使用非官方公开接口；不绕过任何 DRM，
-不缓存、不内置、不分发任何 YouTube 内容。登录 Cookie 仅保存在本机、
+内置播放模式仅使用播放期间存在的匿名临时文件，不内置或分发 YouTube 内容。登录 Cookie 仅保存在本机、
 仅用于向 YouTube 发起请求。使用产生的流量及 YouTube 服务条款相关风险由使用者自行承担。
 
 ## License

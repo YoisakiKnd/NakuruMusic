@@ -41,11 +41,8 @@ impl SavedSession {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text)
+        crate::atomic_file::write(path, text.as_bytes())
             .with_context(|| format!("保存播放会话失败: {}", path.display()))?;
         Ok(())
     }

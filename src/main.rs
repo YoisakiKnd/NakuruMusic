@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod atomic_file;
 mod browser_cookies;
 mod browser_login;
 mod config;
@@ -34,6 +35,8 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    browser_cookies::cleanup_stale_scratch();
 
     let mut cfg = config::load(&dirs)?;
     let startup_warning = preflight(&mut cfg)?;
@@ -78,32 +81,31 @@ fn main() -> Result<()> {
     result
 }
 
-/// mpv is required (it is the audio engine). yt-dlp is optional: stream URLs
-/// are resolved in-process, so it is only used for browser cookie import (and
-/// as mpv's fallback resolver if our own resolution fails).
+/// mpv is required only for the mpv backend. yt-dlp is optional: stream URLs
+/// are resolved in-process, and it can serve as mpv's fallback resolver.
 /// Both tools are located beyond PATH (scoop/winget dirs) so a terminal
 /// opened before installation still works.
 fn preflight(cfg: &mut config::Config) -> Result<Option<String>> {
-    match config::resolve_tool(&cfg.playback.mpv_path, "mpv", "mpv") {
-        Some(path) => {
-            info!("mpv resolved: {path}");
-            cfg.playback.mpv_path = path;
+    if cfg.playback.engine == config::PlaybackEngine::Mpv {
+        match config::resolve_tool(&cfg.playback.mpv_path, "mpv", "mpv") {
+            Some(path) => {
+                info!("mpv resolved: {path}");
+                cfg.playback.mpv_path = path;
+            }
+            None => bail!(
+                "未检测到 mpv（已尝试 PATH、scoop、Program Files）。\n\n\
+                 请安装 mpv，或在配置文件 [playback] 中设置 engine = \"native\" 使用内置播放器。"
+            ),
         }
-        None => bail!(
-            "未检测到 mpv（已尝试 PATH、scoop、Program Files）。\n\n\
-             mpv 是本程序的音频引擎，请先安装：\n\
-             \x20   scoop install mpv   （或 winget install mpv）\n\n\
-             若安装在特殊位置，请在配置文件中设置 playback.mpv_path 为完整路径。"
-        ),
-    }
-    // Absence is not worth a startup toast - the login page explains it in
-    // context, and playback no longer depends on it.
-    match config::resolve_tool("yt-dlp", "yt-dlp", "yt-dlp") {
-        Some(path) => {
-            info!("yt-dlp resolved: {path}");
-            cfg.ytdlp_path = Some(path);
+        // Only mpv can use this fallback. Native playback never probes or
+        // starts either external executable.
+        match config::resolve_tool("yt-dlp", "yt-dlp", "yt-dlp") {
+            Some(path) => {
+                info!("yt-dlp resolved: {path}");
+                cfg.ytdlp_path = Some(path);
+            }
+            None => info!("yt-dlp not found (optional mpv URL fallback unavailable)"),
         }
-        None => info!("yt-dlp not found (optional: browser cookie import only)"),
     }
     Ok(None)
 }
@@ -146,25 +148,30 @@ async fn run(
         None => app.toast("欢迎使用 ytbm-tui - / 搜索 - L 音乐库 - ? 帮助"),
     }
 
+    let mut redraw = true;
     while !app.should_quit {
-        let mut layout = ui::UiLayout::default();
-        terminal.draw(|f| layout = ui::draw(f, &mut app))?;
-        app.ui_layout = layout;
+        if redraw {
+            let mut layout = ui::UiLayout::default();
+            terminal.draw(|f| layout = ui::draw(f, &mut app))?;
+            app.ui_layout = layout;
+        }
         let Some(ev) = rx.recv().await else { break };
-        app.handle(ev);
+        redraw = app.handle(ev);
         // Coalesce whatever else is already queued before redrawing.
         while let Ok(ev) = rx.try_recv() {
-            app.handle(ev);
+            redraw |= app.handle(ev);
         }
         if app.player_restart_requested {
             app.player_restart_requested = false;
             app.player = wire_player(&app.config, tx.clone());
             app.toast("正在重启播放器..");
+            redraw = true;
         }
     }
 
-    // Graceful mpv teardown; kill_on_drop is the safety net.
+    // Graceful player teardown; mpv's kill_on_drop is its safety net.
     app.player.send(player::PlayerCmd::Shutdown);
+    app.wait_persistence().await;
     app.save_session();
     app.save_history();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -175,12 +182,15 @@ async fn run(
 /// Spawn the player task and bridge its events into the app channel.
 fn wire_player(cfg: &config::Config, tx: mpsc::UnboundedSender<AppEvent>) -> player::PlayerHandle {
     let (pev_tx, mut pev_rx) = mpsc::unbounded_channel::<player::PlayerEvent>();
-    let handle = player::spawn_player(
-        cfg.playback.mpv_path.clone(),
-        cfg.ytdlp_path.clone(),
-        cfg.playback.volume,
-        pev_tx,
-    );
+    let handle = match cfg.playback.engine {
+        config::PlaybackEngine::Mpv => player::spawn_player(
+            cfg.playback.mpv_path.clone(),
+            cfg.ytdlp_path.clone(),
+            cfg.playback.volume,
+            pev_tx,
+        ),
+        config::PlaybackEngine::Native => player::spawn_native_player(cfg.playback.volume, pev_tx),
+    };
     tokio::spawn(async move {
         while let Some(pe) = pev_rx.recv().await {
             if tx.send(AppEvent::Player(pe)).is_err() {
@@ -241,4 +251,18 @@ fn spawn_tick_task(tx: mpsc::UnboundedSender<AppEvent>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_preflight_needs_no_external_player() {
+        let mut cfg = config::Config::default();
+        cfg.playback.engine = config::PlaybackEngine::Native;
+        cfg.playback.mpv_path = "definitely-not-installed-mpv".into();
+        assert!(preflight(&mut cfg).is_ok());
+        assert!(cfg.ytdlp_path.is_none());
+    }
 }

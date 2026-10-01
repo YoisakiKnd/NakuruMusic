@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Focus};
 
-use super::{fit_w, pane_border, ACCENT, DIM};
+use super::{fit_w, pane_border, visible_start, ACCENT, DIM};
 
 /// Returns the list hit area + scroll offset for mouse support.
 pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
@@ -38,11 +38,20 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
     };
     let title_w = usable.saturating_sub(if artist_w > 0 { artist_w + 1 } else { 0 });
 
+    let selected = if focused {
+        app.queue_selected
+    } else {
+        current.unwrap_or(app.queue_selected)
+    }
+    .min(app.queue.len() - 1);
+    let start = visible_start(app.queue.len(), selected, inner.height);
     let items: Vec<ListItem> = app
         .queue
         .items()
         .iter()
         .enumerate()
+        .skip(start)
+        .take(inner.height as usize)
         .map(|(i, t)| {
             let is_current = Some(i) == current;
             let marker = if is_current { "> " } else { "  " };
@@ -70,11 +79,11 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     if focused {
-        state.select(Some(app.queue_selected.min(app.queue.len() - 1)));
+        state.select(Some(selected - start));
     } else {
         // Keep the playing track visible when the pane is not focused.
-        state.select(current);
+        state.select(current.map(|_| selected - start));
     }
     f.render_stateful_widget(list, inner, &mut state);
-    Some((inner, state.offset()))
+    Some((inner, start))
 }

@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Focus, MainView};
+use crate::app::{Action, App, Focus, MainView};
 
 /// Where interactive things ended up on screen this frame - filled by
 /// `draw`, consumed by the mouse handler.
@@ -22,7 +22,7 @@ use crate::app::{App, Focus, MainView};
 pub struct UiLayout {
     /// (kind, list content area, scroll offset of the first visible row)
     pub main_list: Option<(MainListKind, Rect, usize)>,
-    pub search_tabs: Option<Rect>,
+    pub search_tabs: [Option<Rect>; 4],
     /// Whole queue pane (for focus), list content area and scroll offset.
     pub queue_pane: Option<Rect>,
     pub queue_list: Option<(Rect, usize)>,
@@ -47,6 +47,7 @@ pub enum MainListKind {
     Search,
     Browse,
     Library,
+    History,
 }
 
 pub const ACCENT: Color = Color::Red; // YouTube-ish accent
@@ -175,6 +176,15 @@ pub fn fit_w(s: &str, max: usize) -> String {
     out
 }
 
+/// First logical row to draw while keeping the selection in the viewport.
+pub fn visible_start(total: usize, selected: usize, height: u16) -> usize {
+    let visible = height as usize;
+    selected
+        .min(total.saturating_sub(1))
+        .saturating_sub(visible / 2)
+        .min(total.saturating_sub(visible))
+}
+
 /// One track row laid out in columns: title | artist | duration.
 /// Shared by the browse, search, home and queue views so every list lines up.
 pub fn track_spans(
@@ -215,7 +225,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> UiLayout {
     let mut layout = UiLayout::default();
     // The status row only exists while there is something to say, so no
     // screen space is wasted on an empty bar.
-    let status_h = u16::from(app.status.is_some());
+    let status_h = u16::from(app.status.is_some() || app.detail_retry_hint.is_some());
     let [nav_area, content_area, status_area, bar_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(5),
@@ -229,6 +239,9 @@ pub fn draw(f: &mut Frame, app: &mut App) -> UiLayout {
     // The now-playing page wants every column it can get for cover art and
     // lyrics, so the queue steps aside there.
     let show_queue = content_area.width >= 84 && app.main_view != MainView::NowPlaying;
+    if !show_queue && app.focus == Focus::Queue {
+        app.focus = Focus::Main;
+    }
     let (main_area, queue_area) = if show_queue {
         let [m, q] =
             Layout::horizontal([Constraint::Min(50), Constraint::Length(34)]).areas(content_area);
@@ -248,7 +261,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> UiLayout {
     layout.gauge = player_bar::draw(f, app, bar_area);
 
     if app.help_visible {
-        overlay::draw_help(f);
+        overlay::draw_help(f, app);
     }
     layout
 }
@@ -260,14 +273,42 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) -> [Option<(Rect, MainView)>; 
     let mut hits: [Option<(Rect, MainView)>; NAV_TABS.len()] = Default::default();
     let mut spans = Vec::new();
     let mut x = area.x;
+    let compact = area.width < 70;
+    let compact_labels = ["首页", "搜索", "库", "史", "播"];
+    let hint = if compact {
+        format!(
+            "{} {}",
+            app.key_label(Action::Help),
+            app.key_label(Action::Quit)
+        )
+    } else {
+        format!(
+            "{} 帮助  {} 退出",
+            app.key_label(Action::Help),
+            app.key_label(Action::Quit)
+        )
+    };
+    let hint_w = hint.width() as u16;
+    let tab_right = area.right().saturating_sub(hint_w + 1);
 
     for (i, (label, key, view)) in NAV_TABS.iter().enumerate() {
         let active = app.main_view == *view
             // Browsing is reached from search results, so keep that tab lit.
             || (app.main_view == MainView::Browse && *view == MainView::Search);
-        let text = format!(" {label} {key} ");
+        let active_key = match view {
+            MainView::Search => app.key_label(Action::Search),
+            MainView::Library => app.key_label(Action::Library),
+            MainView::History => app.key_label(Action::History),
+            MainView::NowPlaying => app.key_label(Action::LyricsToggle),
+            _ => (*key).to_string(),
+        };
+        let text = if compact {
+            format!("{active_key}{} ", compact_labels[i])
+        } else {
+            format!(" {label} {active_key} ")
+        };
         let w = text.width() as u16;
-        if x + w > area.right() {
+        if x.saturating_add(w) > tab_right {
             break;
         }
         spans.push(Span::styled(
@@ -292,11 +333,10 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) -> [Option<(Rect, MainView)>; 
         x += w;
     }
 
-    // Right-aligned hint so the help key is never a secret.
-    let hint = "? 帮助  q 退出";
-    let hint_w = hint.width() as u16;
+    // Reserve the right edge before laying out tabs so help/quit stay visible
+    // even in a 40-column terminal.
     f.render_widget(Paragraph::new(Line::from(spans)), area);
-    if area.width > x - area.x + hint_w + 2 {
+    if area.width >= hint_w {
         f.render_widget(
             Paragraph::new(hint).style(Style::default().fg(DIM)),
             Rect {
@@ -312,7 +352,9 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) -> [Option<(Rect, MainView)>; 
 
 /// Transient messages get their own row instead of covering list content.
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let Some(msg) = &app.status else { return };
+    let Some(msg) = app.status.as_ref().or(app.detail_retry_hint.as_ref()) else {
+        return;
+    };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" ! ", Style::default().fg(Color::Black).bg(Color::Yellow)),
@@ -386,7 +428,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect, layout: &mut UiLayout) {
         }
         MainView::History => {
             if let Some(hit) = history::draw(f, app, inner) {
-                layout.main_list = Some((MainListKind::Library, hit.0, hit.1));
+                layout.main_list = Some((MainListKind::History, hit.0, hit.1));
             }
         }
     }
@@ -395,6 +437,49 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect, layout: &mut UiLayout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_input_never_enters_terminal_buffer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let secret = "SAPISID=very-secret-value";
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|f| search::draw_input(f, crate::app::InputMode::Login, secret, f.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(!line.contains("SAPISID"));
+        assert!(!line.contains("very-secret-value"));
+        assert!(line.contains("Cookie>"));
+    }
+
+    #[test]
+    fn search_input_shows_submit_and_cancel_at_narrow_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                search::draw_input(
+                    f,
+                    crate::app::InputMode::Search,
+                    "long search query",
+                    f.area(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(line.contains("Enter"));
+        assert!(line.contains("Esc"));
+    }
 
     #[test]
     fn truncate_counts_display_columns_not_chars() {

@@ -51,7 +51,7 @@ jobs:
 
       - name: Install Linux build deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libasound2-dev
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -104,13 +104,14 @@ jobs:
           body: |
             ## 安装
 
-            下载对应平台的压缩包解压即可，另需两个外部程序：
+            下载对应平台的压缩包解压即可。内置播放器无需外部程序；在配置文件中设置
+            `[playback] engine = "native"` 即可启用。默认仍使用 mpv：
 
             ```
-            scoop install mpv yt-dlp      # 或 winget install mpv yt-dlp
+            scoop install mpv             # 或 winget install mpv
             ```
 
-            mpv 是音频引擎，yt-dlp 负责解析播放地址（程序会自动在 PATH、
-            scoop、Program Files 中寻找，装完不必重开终端）。
+            mpv 是默认音频引擎。播放地址通常由程序自行解析；mpv 模式解析失败时，
+            yt-dlp 可作为兜底。程序会自动在 PATH、scoop、Program Files 中寻找 mpv。
 
             完整说明见 [README](https://github.com/YoisakiKnd/ytbm-tui#readme)。

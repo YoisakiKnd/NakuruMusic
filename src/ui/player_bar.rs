@@ -62,6 +62,15 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         return None;
     };
 
+    if !pb.alive {
+        f.render_widget(
+            Paragraph::new(format!("!  播放器未运行 (R 重启)  {title}"))
+                .style(Style::default().fg(DIM)),
+            inner,
+        );
+        return None;
+    }
+
     let marker = state_marker(pb.loading, pb.paused);
     let title_text = if pb.loading {
         let hint = if pb.loading_secs >= 15.0 {

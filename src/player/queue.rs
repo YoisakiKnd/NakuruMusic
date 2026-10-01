@@ -104,12 +104,17 @@ impl Queue {
         Some(start)
     }
 
-    pub fn restore(&mut self, tracks: Vec<Track>, current: usize, repeat: RepeatMode) -> bool {
-        if tracks.is_empty() || current >= tracks.len() {
+    pub fn restore(
+        &mut self,
+        tracks: Vec<Track>,
+        current: Option<usize>,
+        repeat: RepeatMode,
+    ) -> bool {
+        if tracks.is_empty() || current.is_some_and(|i| i >= tracks.len()) {
             return false;
         }
         self.items = tracks;
-        self.current = Some(current);
+        self.current = current;
         self.repeat = repeat;
         true
     }

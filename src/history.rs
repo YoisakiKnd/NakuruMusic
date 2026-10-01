@@ -13,7 +13,7 @@ pub struct HistoryEntry {
     pub played_at: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlaybackHistory {
     entries: Vec<HistoryEntry>,
 }
@@ -42,11 +42,8 @@ impl PlaybackHistory {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text)
+        crate::atomic_file::write(path, text.as_bytes())
             .with_context(|| format!("保存播放历史失败: {}", path.display()))?;
         Ok(())
     }

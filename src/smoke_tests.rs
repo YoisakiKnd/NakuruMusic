@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::api::models::{SearchKind, Track};
 use crate::api::rustypipe::RustyPipeApi;
-use crate::api::MusicApi;
+use crate::api::{MusicApi, StreamFormat};
 
 fn api() -> Arc<dyn MusicApi> {
     let dir = std::env::temp_dir()
@@ -69,9 +69,9 @@ async fn radio_from_track() {
     println!("radio: {} tracks, first: {}", radio.len(), radio[0].title);
 }
 
-/// The in-process replacement for mpv's yt-dlp hook: resolve a stream URL and
-/// prove it is actually fetchable by pulling the first bytes with a Range
-/// request. A URL that resolves but 403s would otherwise look like success.
+/// Resolve a stream URL and check that its first bytes are fetchable. This is
+/// only an initial connectivity check: some URLs return HTTP 403 for later
+/// ranges, so full native playback must pass the separate whole-track test.
 ///
 /// The URL carries credentials in its query string, so only the host and the
 /// response status are printed.
@@ -85,7 +85,7 @@ async fn resolve_and_fetch_stream() {
         .expect("search failed");
     let track = &results.tracks[0];
     let url = a
-        .stream_url(&track.video_id)
+        .stream_url(&track.video_id, StreamFormat::Best)
         .await
         .expect("stream resolution failed");
     assert!(url.starts_with("https://"), "not an https URL");
@@ -112,6 +112,82 @@ async fn resolve_and_fetch_stream() {
         "stream URL not playable: HTTP {status}"
     );
     assert!(!bytes.is_empty(), "stream returned no data");
+}
+
+/// Whole-track check of the default mpv path using the same resolved direct
+/// URL as the application. Requires YTBM_TEST_MPV to point to an mpv binary.
+#[tokio::test]
+#[ignore = "requires YTBM_TEST_MPV, network access and a complete YouTube stream"]
+async fn mpv_direct_stream_completes() {
+    let mpv = std::env::var("YTBM_TEST_MPV").expect("set YTBM_TEST_MPV");
+    let a = api();
+    let results = a
+        .search("Never Gonna Give You Up", SearchKind::Songs)
+        .await
+        .expect("search failed");
+    let url = a
+        .stream_url(&results.tracks[0].video_id, StreamFormat::Best)
+        .await
+        .expect("stream resolution failed");
+    let mut child = tokio::process::Command::new(mpv)
+        .args([
+            "--no-config",
+            "--no-video",
+            "--ao=null",
+            "--untimed",
+            "--cache=no",
+            "--no-terminal",
+        ])
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("mpv did not start");
+    let status = tokio::time::timeout(std::time::Duration::from_secs(300), child.wait())
+        .await
+        .expect("mpv did not finish the track within 300 seconds")
+        .expect("mpv wait failed");
+    assert!(status.success(), "mpv direct stream failed: {status}");
+}
+
+/// Check later byte ranges across real search results; a playable first MiB
+/// alone does not prove that a URL can finish the song.
+#[tokio::test]
+#[ignore = "requires network access and current YouTube streams"]
+async fn searched_songs_have_readable_later_ranges() {
+    let a = api();
+    let results = a
+        .search("Never Gonna Give You Up", SearchKind::Songs)
+        .await
+        .expect("search failed");
+    let mut blocked = Vec::new();
+    let client = http();
+    for track in results.tracks.iter().take(5) {
+        let url = a
+            .stream_url(&track.video_id, StreamFormat::Mp4Aac)
+            .await
+            .expect("stream resolution failed");
+        let first = client
+            .get(&url)
+            .header("Range", "bytes=0-1048575")
+            .send()
+            .await
+            .expect("first range request failed");
+        assert!(first.status().is_success());
+        assert_eq!(first.bytes().await.unwrap().len(), 1_048_576);
+        let response = client
+            .get(url)
+            .header("Range", "bytes=1048576-2097151")
+            .send()
+            .await
+            .expect("range request failed");
+        println!("{} {}: {}", track.video_id, track.title, response.status());
+        if !response.status().is_success() {
+            blocked.push(track.video_id.clone());
+        }
+    }
+    assert!(blocked.is_empty(), "later ranges blocked for {blocked:?}");
 }
 
 #[tokio::test]
@@ -173,13 +249,11 @@ async fn browser_cookie_import_plumbing() {
     }
     assert!(!browsers.is_empty(), "no browsers detected");
 
-    let work = std::env::temp_dir().join("ytbm-tui-smoke");
-
     // read_cookies returns a ready-to-send Cookie header, and only succeeds
     // when the profile actually carries a YouTube credential.
     let mut any_usable = false;
     for b in &browsers {
-        match crate::browser_cookies::read_cookies(b, &work) {
+        match crate::browser_cookies::read_cookies(b) {
             Ok(header) => {
                 assert!(
                     crate::browser_login::has_auth_credential(&header),
@@ -203,14 +277,12 @@ async fn browser_cookie_import_plumbing() {
         any_usable,
         "no browser profile yielded a usable YouTube credential"
     );
-    // The reader must not leave its temporary DB copies behind.
-    let leftovers: Vec<_> = std::fs::read_dir(&work)
+    // The reader must not leave its private temporary directory behind.
+    let prefix = format!("ytbm-cookie-{}-", std::process::id());
+    let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
         .map(|it| {
             it.filter_map(Result::ok)
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().into_owned();
-                    n.starts_with("ff-cookies") || n.starts_with("cr-cookies")
-                })
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
                 .collect()
         })
         .unwrap_or_default();
@@ -226,36 +298,42 @@ async fn browser_cookie_import_plumbing() {
 #[tokio::test]
 #[ignore]
 async fn browser_login_authenticates() {
-    let work = std::env::temp_dir().join("ytbm-tui-smoke");
-    let scratch = work.join("auth-check");
-    let _ = std::fs::remove_dir_all(&scratch);
+    let scratch = tempfile::tempdir().expect("create isolated auth test directory");
 
-    let api = RustyPipeApi::new(scratch.clone()).expect("init api");
+    let api = RustyPipeApi::new(scratch.path().join("rustypipe")).expect("init api");
     assert!(!api.is_logged_in(), "fresh profile must start logged out");
 
     let mut authenticated = false;
     for b in crate::browser_cookies::detect() {
-        let Ok(cookies) = crate::browser_cookies::read_cookies(&b, &work) else {
+        let Ok(cookies) = crate::browser_cookies::read_cookies(&b) else {
             continue;
         };
         match api.login_cookie(&cookies).await {
             Ok(()) => {
                 assert!(api.is_logged_in());
                 let playlists = api.saved_playlists().await.expect("library call failed");
-                let liked = api.liked_tracks().await.map(|t| t.len());
+                let liked = api.liked_tracks().await.expect("liked tracks call failed");
+                let albums = api.saved_albums().await.expect("saved albums call failed");
+                let artists = api
+                    .saved_artists()
+                    .await
+                    .expect("saved artists call failed");
+                let history = api.history().await.expect("history call failed");
                 println!(
-                    "authenticated via {} → saved playlists: {}, liked tracks: {:?}",
+                    "authenticated via {} → playlists: {}, liked: {}, albums: {}, artists: {}, history: {}",
                     b.display,
                     playlists.len(),
-                    liked
+                    liked.len(),
+                    albums.len(),
+                    artists.len(),
+                    history.len()
                 );
                 authenticated = true;
                 break;
             }
-            Err(e) => println!("  {} → {e:#}", b.display),
+            Err(_) => println!("  {} → authentication failed", b.display),
         }
     }
-    let _ = std::fs::remove_dir_all(&scratch);
     assert!(
         authenticated,
         "no browser produced a working YouTube Music login - this test \

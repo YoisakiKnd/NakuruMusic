@@ -2,6 +2,8 @@
 //! and receives [`PlayerEvent`]s; the mpv process/IPC lives in `mpv_ipc`.
 
 mod mpv_ipc;
+mod native;
+mod progressive;
 pub mod queue;
 
 use serde_json::json;
@@ -15,7 +17,11 @@ pub enum PlayerCmd {
     /// Normally a direct audio-stream URL resolved by the API layer. A
     /// `watch?v=` URL also works and makes mpv fall back to its yt-dlp hook,
     /// which is what happens when our own resolution fails.
-    Load(String),
+    Load {
+        url: String,
+        play_seq: u64,
+    },
+    Stop,
     TogglePause,
     ToggleMute,
     SeekRel(f64),
@@ -28,18 +34,26 @@ pub enum PlayerCmd {
 pub enum PlayerEvent {
     Ready,
     InitFailed(String),
+    Track {
+        play_seq: u64,
+        event: TrackEvent,
+    },
+    Volume(i64),
+    Muted(bool),
+    /// mpv process/IPC gone unexpectedly.
+    Died,
+}
+
+#[derive(Debug, Clone)]
+pub enum TrackEvent {
     FileLoaded,
     TimePos(f64),
     Duration(f64),
     Paused(bool),
-    Volume(i64),
-    Muted(bool),
     /// end-file reason=eof - natural track end, advance the queue.
     TrackEnded,
     /// end-file reason=error - extraction/decode failed for this track.
     LoadFailed(String),
-    /// mpv process/IPC gone unexpectedly.
-    Died,
 }
 
 #[derive(Clone)]
@@ -49,9 +63,17 @@ pub struct PlayerHandle {
 
 impl PlayerHandle {
     pub fn send(&self, cmd: PlayerCmd) {
-        // A dead player surfaces as PlayerEvent::Died; dropping the command
-        // here is fine.
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    pub fn send_checked(&self, cmd: PlayerCmd) -> bool {
+        self.cmd_tx.send(cmd).is_ok()
+    }
+
+    #[cfg(test)]
+    pub fn test_handle() -> (Self, mpsc::UnboundedReceiver<PlayerCmd>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        (Self { cmd_tx }, cmd_rx)
     }
 }
 
@@ -69,6 +91,17 @@ pub fn spawn_player(
         cmd_rx,
         ev_tx,
     ));
+    PlayerHandle { cmd_tx }
+}
+
+/// In-process AAC/MP4 playback. Audio is streamed through an anonymous
+/// temporary file with a short prebuffer; the file disappears on close.
+pub fn spawn_native_player(
+    initial_volume: i64,
+    ev_tx: mpsc::UnboundedSender<PlayerEvent>,
+) -> PlayerHandle {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    tokio::spawn(native::run(initial_volume, cmd_rx, ev_tx));
     PlayerHandle { cmd_tx }
 }
 
@@ -104,15 +137,23 @@ async fn player_task(
 
     while let Some(cmd) = cmd_rx.recv().await {
         let result = match cmd {
-            PlayerCmd::Load(url) => {
+            PlayerCmd::Load { url, play_seq } => {
                 // Stream URLs carry credentials in the query string - log the
                 // origin only, never the full URL.
                 info!(
                     "loadfile {}",
                     url.split_once('?').map_or(url.as_str(), |(base, _)| base)
                 );
-                mpv.command(json!(["loadfile", url, "replace"])).await
+                let result = mpv.load(&url, play_seq).await;
+                if let Err(e) = &result {
+                    let _ = ev_tx.send(PlayerEvent::Track {
+                        play_seq,
+                        event: TrackEvent::LoadFailed(format!("mpv 加载命令失败: {e}")),
+                    });
+                }
+                result
             }
+            PlayerCmd::Stop => mpv.command(json!(["stop"])).await,
             PlayerCmd::TogglePause => mpv.command(json!(["cycle", "pause"])).await,
             PlayerCmd::ToggleMute => mpv.command(json!(["cycle", "mute"])).await,
             PlayerCmd::SeekRel(secs) => mpv.command(json!(["seek", secs, "relative"])).await,

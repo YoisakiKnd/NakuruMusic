@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use innertube_rs::{FormatFilter, FormatType, GetVideoInfoOptions, Innertube, QualityPreference};
 use rustypipe::client::{RustyPipe, RustyPipeQuery};
 use rustypipe::error::Error as RpError;
 use rustypipe::model::{AlbumItem, ArtistId, ArtistItem, MusicPlaylistItem, TrackItem};
-use rustypipe::param::StreamFilter;
+use tokio::sync::OnceCell;
 
 use super::models::{
     AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, PlaylistDetail, PlaylistSummary,
@@ -21,6 +22,7 @@ use super::MusicApi;
 pub struct RustyPipeApi {
     rp: RustyPipe,
     query: RustyPipeQuery,
+    stream_client: OnceCell<Innertube>,
     /// rustypipe persists the auth cookie in its own cache; this marker file
     /// lets us know login state without poking its internals.
     login_marker: PathBuf,
@@ -41,6 +43,7 @@ impl RustyPipeApi {
         Ok(Self {
             query: rp.query(),
             rp,
+            stream_client: OnceCell::new(),
             login_marker,
             logged_in,
         })
@@ -233,26 +236,54 @@ impl MusicApi for RustyPipeApi {
         Ok(r.items.into_iter().map(conv_track).collect())
     }
 
-    async fn stream_url(&self, video_id: &str) -> Result<String> {
-        // `player` picks its own client order. Without a botguard binary that
-        // order is [Ios, Tv] - and `ClientType::needs_po_token` covers only
-        // Desktop/DesktopMusic/Mobile, so neither needs a PO token. Ios also
-        // reports `needs_deobf() == false` (unobfuscated URLs), so the common
-        // path does not even run the base.js deobfuscation.
-        let player = self.query.player(video_id).await?;
-        // Default filter = highest-quality audio, which for music is the
-        // ~160kbps Opus stream.
-        let stream = player
-            .select_audio_stream(&StreamFilter::new())
-            .context("该曲目没有可用的音频流")?;
+    async fn stream_url(&self, video_id: &str, _format: super::StreamFormat) -> Result<String> {
+        // RustyPipe's iOS URL currently stops after roughly 1 MiB with 403.
+        // VisionOS supplies regular byte-range AAC URLs without an external
+        // player, JS executable or PO-token helper. Its embedded QuickJS
+        // decipher engine is initialized once on the first playback request.
+        let client = self
+            .stream_client
+            .get_or_try_init(Innertube::new)
+            .await
+            .context("初始化内置音频地址解析器失败")?;
+        let options = GetVideoInfoOptions {
+            client: Some("VISIONOS".into()),
+            ..Default::default()
+        };
+        let info = client
+            .get_basic_info(video_id, Some(&options))
+            .await
+            .context("获取 VisionOS 音频地址失败")?;
+        // Keep MP4/AAC for both engines until other codecs have end-to-end
+        // device coverage. "Best" currently means the best AAC stream.
+        let filter = FormatFilter {
+            format_type: FormatType::AudioOnly,
+            quality: QualityPreference::Highest,
+            container: Some("mp4".into()),
+        };
+        let stream = innertube_rs::endpoints::player::select_format(&info.player_response, &filter)
+            .context("该曲目没有可用的 AAC 音频流")?;
+        let url = innertube_rs::endpoints::player::resolve_stream_url_full(
+            stream,
+            &client.player.decipherer,
+            client.session.po_token.as_deref(),
+            None,
+        )
+        .context("解码音频地址失败")?;
+        let source_client = reqwest::Url::parse(&url)?
+            .query_pairs()
+            .find(|(key, _)| key == "c")
+            .map(|(_, value)| value.into_owned());
+        if source_client.as_deref() != Some("VISIONOS") {
+            bail!("VisionOS 音频地址不可用，已拒绝可能截断的备用地址");
+        }
         tracing::debug!(
-            "resolved stream: itag={} codec={:?} bitrate={} client={:?}",
+            "resolved VisionOS stream: itag={} mime={} bitrate={}",
             stream.itag,
-            stream.codec,
+            stream.mime_type,
             stream.bitrate,
-            player.client_type
         );
-        Ok(stream.url.clone())
+        Ok(url)
     }
 
     async fn plain_lyrics(&self, video_id: &str) -> Result<Option<String>> {

@@ -37,6 +37,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
 
     let hint = if app.library.loading {
         "加载中.."
+    } else if app.library.failed {
+        "加载失败    Enter 重试当前项目   x 退出登录   Esc 返回"
     } else {
         "已登录    Enter 打开   x 退出登录   Esc 返回"
     };
@@ -94,7 +96,7 @@ fn draw_login(f: &mut Frame, app: &App, area: Rect) -> Option<(Rect, usize)> {
 
     let hint: Vec<Line> = if app.login.busy {
         vec![Line::styled(
-            "正在读取浏览器登录信息..",
+            "正在处理登录状态..",
             Style::default().fg(ACCENT),
         )]
     } else {

@@ -16,6 +16,7 @@
 //! DB copy is deleted as soon as it has been read.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use tracing::info;
@@ -122,6 +123,11 @@ const CANDIDATES: &[Candidate] = &[
 
 #[cfg(target_os = "macos")]
 const CANDIDATES: &[Candidate] = &[
+    Candidate {
+        display: "Waterfox",
+        store: CookieStore::Firefox,
+        paths: &[(Base::Home, "Library/Application Support/Waterfox/Profiles")],
+    },
     Candidate {
         display: "Firefox",
         store: CookieStore::Firefox,
@@ -303,15 +309,16 @@ fn collect_chromium(display: &str, user_data: &Path, out: &mut Vec<BrowserProfil
 /// Read the YouTube cookies of `profile` and return a `name=value; ..` header.
 ///
 /// Called from a background task - it does blocking file I/O.
-pub fn read_cookies(profile: &BrowserProfile, work_dir: &Path) -> Result<String> {
+pub fn read_cookies(profile: &BrowserProfile) -> Result<String> {
+    let scratch = CookieScratchDir::new()?;
     let pairs = match profile.store {
-        CookieStore::Firefox => firefox::read(&profile.db, work_dir)?,
+        CookieStore::Firefox => firefox::read(&profile.db, scratch.path())?,
         CookieStore::Chromium => {
             let local_state = profile
                 .local_state
                 .as_deref()
                 .context("找不到该浏览器的 Local State 文件")?;
-            chromium::read(&profile.db, local_state, work_dir)?
+            chromium::read(&profile.db, local_state, scratch.path())?
         }
     };
 
@@ -329,6 +336,100 @@ pub fn read_cookies(profile: &BrowserProfile, work_dir: &Path) -> Result<String>
         profile.store
     );
     Ok(header)
+}
+
+/// Private, short-lived workspace for a browser database snapshot.
+struct CookieScratchDir(PathBuf);
+
+/// Remove snapshots left behind by crashes. Every import normally removes its
+/// own directory immediately; only directories older than a day are touched,
+/// so another running instance's current import remains untouched.
+pub fn cleanup_stale_scratch() {
+    let removed = cleanup_stale_scratch_in(&std::env::temp_dir(), Duration::from_secs(24 * 3600));
+    if removed > 0 {
+        info!("removed {removed} stale cookie scratch directories");
+    }
+}
+
+fn cleanup_stale_scratch_in(root: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !scratch_name(name) {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age > max_age)
+            && std::fs::remove_dir_all(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn scratch_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("ytbm-cookie-") else {
+        return false;
+    };
+    let Some((pid, nonce)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|c| c.is_ascii_digit())
+        && nonce.len() == 16
+        && nonce.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+impl CookieScratchDir {
+    fn new() -> Result<Self> {
+        for _ in 0..8 {
+            let path = std::env::temp_dir().join(format!(
+                "ytbm-cookie-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = std::fs::DirBuilder::new();
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!("无法创建临时 Cookie 工作目录")
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CookieScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Copy a SQLite DB (plus its WAL sidecars) somewhere we can open it.
@@ -628,5 +729,22 @@ mod tests {
         assert!(!is_youtube_host("google.com"));
         assert!(!is_youtube_host("notyoutube.com"));
         assert!(!is_youtube_host("youtube.com.evil.net"));
+    }
+
+    #[test]
+    fn stale_cleanup_only_removes_matching_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let stale = root.path().join("ytbm-cookie-123-0123456789abcdef");
+        let unrelated = root.path().join("ytbm-cookie-unrelated");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        assert_eq!(
+            cleanup_stale_scratch_in(root.path(), Duration::from_secs(3600)),
+            0
+        );
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(cleanup_stale_scratch_in(root.path(), Duration::ZERO), 1);
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
     }
 }

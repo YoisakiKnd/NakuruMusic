@@ -1,7 +1,7 @@
 # ytbm-tui — 项目约定
 
-轻量级 YouTube Music TUI 客户端（Rust + ratatui + mpv）。完整设计与里程碑见
-`C:\Users\TenonSuzu\.claude\plans\youtubemusic-tui-curried-rain.md`。
+轻量级 YouTube Music TUI 客户端（Rust + ratatui，内置 AAC 或 mpv 播放）。
+当前更新计划见 `UPDATE_PLAN.md`。
 
 ## 构建与测试
 
@@ -28,8 +28,8 @@ cargo test --all-targets
 CI 在 Windows/Linux/macOS 三平台跑。发布：推 `v*` 标签即触发 `release.yml`
 交叉构建四个产物并自动建 GitHub Release，**不要手工传附件**。
 
-运行依赖外部程序：`winget install mpv`（必需，音频引擎）。yt-dlp **可选**，只用于
-浏览器 Cookie 导入，以及自己解析播放地址失败时的兜底。
+默认 mpv 后端需要 `winget install mpv`。配置 `playback.engine = "native"` 可使用
+内置 AAC 后端，无需 mpv。yt-dlp **可选**，仅用于 mpv 解析失败时的兜底。
 
 ## 架构要点
 
@@ -38,30 +38,31 @@ CI 在 Windows/Linux/macOS 三平台跑。发布：推 `v*` 标签即触发 `rel
   `tokio::spawn` 后经通道回流，**严禁阻塞主循环**。
 - **播放**：`player/mpv_ipc.rs` spawn `mpv --no-video --idle` 子进程，JSON IPC
   （Windows 命名管道 `\\.\pipe\ytbm-mpv-{pid}`）。曲目结束只认 `end-file` 事件的
-  `reason=eof`；`stop/quit` 是我们自己触发的，忽略。
-- **播放地址自己解析**（不再走 mpv 的 yt-dlp hook）：`MusicApi::stream_url` 用
-  rustypipe 的 `player()` + `select_audio_stream()` 拿直链。rustypipe 无 botguard
-  时默认客户端顺序是 `[Ios, Tv]`，两者 `needs_po_token()` 均为 false，所以**不需要
-  PO Token**；`Ios` 还 `needs_deobf() == false`，常规路径连 base.js 解混淆都不跑。
-  这条路砍掉了 yt-dlp 和它要求的 deno/node 两层外部依赖。
+  `reason=eof`；`stop/quit` 是我们自己触发的，忽略。`player/native.rs` 使用
+  rodio/CPAL，MP4/AAC 压缩音频预缓冲约 1 MiB 后，从匿名临时文件边下载边解码；
+  单首大小上限 512 MiB。稀疏临时文件支持远端分段优先下载；带完整 `sidx` 的碎片 MP4
+  通过本地 Symphonia 补丁快速启动和跳转。读到未下载的字节会等待，切歌必须唤醒等待读取。
+  曲目相关事件携带 `play_seq`；mpv 通过 `playlist_entry_id` 映射到该代数，
+  `file-loaded` 和属性变化使用最近的 `start-file` 条目，应用只接收当前代数。
+- **播放地址自己解析**：`MusicApi::stream_url` 用 VisionOS 客户端获取 AAC 格式并在
+  进程内解混淆，拒绝可能只能读到开头的备用 iOS 地址。这条路径不需要 yt-dlp 或
+  外部 JS 运行时；签名处理使用内嵌 QuickJS。
   解析在 `start_track` 里 spawn，经 `ApiMsg::StreamResolved` 回流——**必须比对
-  `current_video_id`**，否则用户切歌后迟到的结果会劫持播放。解析失败则回退
-  `watch?v=` URL 交给 mpv 的 hook（yt-dlp 装了才有用）。
+  `play_seq` 与 `current_video_id`**，否则用户切歌后迟到的结果会劫持播放。mpv
+  模式解析失败则回退 `watch?v=` URL 交给 mpv 的 hook（yt-dlp 装了才有用）。
   ⚠️ 直链 query string 里带凭据，**不能整条进日志**，只记 host。
-  ⚠️ YouTube 正在推行 PO Token 强制化。若 `Tv`/`Ios` 也被关上，就只能靠
-  `rustypipe-botguard`（内嵌 Deno + JSDOM 的独立 CLI），外部依赖会回来。
-- **队列权威在 Rust 侧**（`player/queue.rs`，纯逻辑有单测）：一次只给 mpv 一个
-  loadfile，结束后由 App 决定下一首。
+  ⚠️ 真实地址有时在后续 Range 请求返回 HTTP 403，下载器限次重新解析并恢复进度；
+  仍需长期跟踪该限制和 VisionOS 客户端可用性。
+- **队列权威在 Rust 侧**（`player/queue.rs`，纯逻辑有单测）：一次只加载一首，
+  结束后由 App 决定下一首。
 - **元数据**：`api/` 层 `MusicApi` trait 隔离后端；实现用 rustypipe。
   **改 rustypipe 相关代码前先对照本机 registry 缓存里的实际源码校对签名，
   不要凭记忆写。**
 - **登录**：音乐库接口走 `ClientType::DesktopMusic`（web 类），rustypipe 只对
   web 类客户端使用 Cookie 鉴权、仅对 `ClientType::Tv` 用 OAuth——**所以 OAuth
-  设备码登录拿不到音乐库数据，必须用浏览器 Cookie**。`browser_login.rs` 用
-  `yt-dlp --cookies-from-browser`（不带 URL、纯离线）导出，自己解析 Netscape
-  格式成 Cookie 头（rustypipe 自带的解析器只认精确 `.youtube.com` 域名，会丢
-  host-only 行）。yt-dlp 无 URL 时**退出码非零但文件已写入**，判断成败要看文件
-  内容而非退出码。
+  设备码登录拿不到音乐库数据，必须用浏览器 Cookie**。`browser_cookies.rs`
+  直接读取本机浏览器 Cookie 数据库，`browser_login.rs` 负责 Cookie 文本解析
+  与登录校验；不调用 yt-dlp。
 - **凭据处理红线**：Cookie 内容绝不能进 tracing 日志、UI 或错误消息；导出的临时
   文件读取后立即删除；只记录条数。
 - **歌词**：LRCLIB 优先（同步 LRC），回退 YT 纯文本；`lyrics.rs` 有 LRC 解析单测。
