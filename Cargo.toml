@@ -1,6 +1,6 @@
 [package]
 name = "ytbm-tui"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Lightweight YouTube Music TUI client with native and mpv playback"
 license = "GPL-3.0-only"
