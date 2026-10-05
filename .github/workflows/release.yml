@@ -114,7 +114,24 @@ jobs:
           body: |
             ## 安装
 
-            下载对应平台的压缩包解压即可。默认使用内置播放器，无需安装外部程序。
+            默认使用内置播放器，无需安装外部程序。也可下载对应平台的压缩包解压运行。
+
+            Windows PowerShell（Scoop）：
+
+            ```powershell
+            scoop bucket add yoisaki https://github.com/YoisakiKnd/scoop-bucket
+            scoop install yoisaki/nakuru-music
+            nakuru-music
+            ```
+
+            macOS（Homebrew）：
+
+            ```sh
+            brew tap YoisakiKnd/tap
+            brew install nakuru-music
+            nakuru-music
+            ```
+
             按 `,` 打开设置页，可切换到 mpv。使用 mpv 时需先安装：
 
             ```
