@@ -21,6 +21,9 @@ pub enum StreamFormat {
     Mp4Aac,
 }
 
+// async-trait adds #[must_use] to futures, which Clippy 1.99 also treats as
+// implicitly must-use. Keep this allowance scoped to the generated trait.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait MusicApi: Send + Sync {
     async fn search(&self, query: &str, kind: SearchKind) -> Result<SearchResults>;

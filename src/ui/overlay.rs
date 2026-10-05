@@ -12,6 +12,7 @@ const KEYS: &[(&str, &str)] = &[
     ("/", "搜索"),
     ("L", "音乐库 / 登录 (浏览器一键导入)"),
     ("H", "本地播放历史"),
+    (",", "设置 / 切换播放后端"),
     ("1-4 / [ ]", "搜索结果分类切换"),
     ("j/k Up/Down", "移动选择"),
     ("g/G PgUp/Dn", "跳顶/跳底/翻页"),
@@ -43,6 +44,7 @@ pub fn draw_help(f: &mut Frame, app: &App) {
                 "/" => app.key_label(Action::Search),
                 "L" => app.key_label(Action::Library),
                 "H" => app.key_label(Action::History),
+                "," => app.key_label(Action::Settings),
                 "Tab" => app.key_label(Action::FocusToggle),
                 "Space" => app.key_label(Action::PlayPause),
                 "n / p" => format!(

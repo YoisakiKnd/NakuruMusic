@@ -1,13 +1,12 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, LineGauge, Paragraph};
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
 use crate::player::queue::RepeatMode;
 
-use super::{state_marker, ACCENT, DIM};
+use super::{progress, state_marker, DIM};
 
 fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
@@ -104,12 +103,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     } else {
         0.0
     };
-    let gauge = LineGauge::default()
-        .ratio(ratio)
-        .label(Span::raw(""))
-        .filled_style(Style::default().fg(ACCENT))
-        .unfilled_style(Style::default().fg(Color::DarkGray));
-    f.render_widget(gauge, gauge_a);
+    progress::draw(f, gauge_a, ratio);
 
     f.render_widget(Paragraph::new(vol_text), vol_a);
     Some(gauge_a)

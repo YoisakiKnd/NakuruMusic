@@ -422,12 +422,12 @@ fn ipc_addr() -> String {
     let pid = std::process::id();
     #[cfg(windows)]
     {
-        format!(r"\\.\pipe\ytbm-mpv-{pid}")
+        format!(r"\\.\pipe\nakuru-mpv-{pid}")
     }
     #[cfg(not(windows))]
     {
         std::env::temp_dir()
-            .join(format!("ytbm-mpv-{pid}.sock"))
+            .join(format!("nakuru-mpv-{pid}.sock"))
             .to_string_lossy()
             .into_owned()
     }

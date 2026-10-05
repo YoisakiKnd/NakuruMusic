@@ -1,7 +1,18 @@
-# ytbm-tui 完整更新计划
+# NakuruMusic 完整更新计划
 
 本计划以可复现的行为和验收标准组织。`已完成` 表示代码已实现并通过本地自动测试；
 涉及真实 YouTube、音频设备和跨平台打包的项目仍需对应环境验证。
+
+## v0.2.0：NakuruMusic 与分发
+
+| 项目 | 状态 | 验收 |
+| --- | --- | --- |
+| 默认内置播放器 | 本地已实现 | 新配置默认 `native`；旧配置保留用户选择，缺失 mpv 时本次自动回退内置；启动不探测外部工具 |
+| 设置页切换内置 / mpv | 本地已实现 | `,` 打开设置，方向键或鼠标选项，Enter 或双击应用；检查 mpv 后原子保存配置、重建后端并恢复曲目、进度和暂停状态；旧后端事件按代数丢弃 |
+| NakuruMusic 更名及主题 | 本地已实现 | CLI、包名、文档和新数据目录更名；旧数据目录继续读取；浅蓝强调色及双色渐变进度条渲染回归测试通过 |
+| GitHub Release | 待发布 | v0.2.0 在 Windows、Linux、macOS 双架构构建；四个归档及 SHA256SUMS 上传 |
+| Scoop 分发 | 待发布 | `YoisakiKnd/scoop-bucket` 新增 `bucket/nakuru-music.json`，下载地址和哈希与 Release 一致；Windows PowerShell 实机安装仍待验证 |
+| Homebrew 分发 | 待发布 | 新建 `YoisakiKnd/homebrew-tap` 的 Cask，两个 macOS 架构归档哈希与 Release 一致，在 Mac 实机安装并运行 |
 
 ## P0：正确性、状态与凭据（已完成第一轮）
 

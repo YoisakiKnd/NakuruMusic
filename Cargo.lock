@@ -1817,6 +1817,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
+name = "nakuru-music"
+version = "0.2.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-trait",
+ "base64 0.23.0",
+ "directories",
+ "image",
+ "innertube-rs",
+ "rand 0.9.5",
+ "ratatui",
+ "ratatui-image",
+ "reqwest",
+ "rodio",
+ "rusqlite",
+ "rustypipe",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "toml_edit 0.22.27",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "unicode-width",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4909,37 +4941,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
-]
-
-[[package]]
-name = "ytbm-tui"
-version = "0.1.2"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-trait",
- "base64 0.23.0",
- "directories",
- "image",
- "innertube-rs",
- "rand 0.9.5",
- "ratatui",
- "ratatui-image",
- "reqwest",
- "rodio",
- "rusqlite",
- "rustypipe",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "unicode-width",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

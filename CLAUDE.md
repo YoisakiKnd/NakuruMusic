@@ -1,4 +1,4 @@
-# ytbm-tui — 项目约定
+# NakuruMusic — 项目约定
 
 轻量级 YouTube Music TUI 客户端（Rust + ratatui，内置 AAC 或 mpv 播放）。
 当前更新计划见 `UPDATE_PLAN.md`。
@@ -28,8 +28,8 @@ cargo test --all-targets
 CI 在 Windows/Linux/macOS 三平台跑。发布：推 `v*` 标签即触发 `release.yml`
 交叉构建四个产物并自动建 GitHub Release，**不要手工传附件**。
 
-默认 mpv 后端需要 `winget install mpv`。配置 `playback.engine = "native"` 可使用
-内置 AAC 后端，无需 mpv。yt-dlp **可选**，仅用于 mpv 解析失败时的兜底。
+默认内置 AAC 后端，无需外部程序。按 `,` 打开设置页可切换 mpv；切换前需
+`winget install mpv`。yt-dlp **可选**，仅用于 mpv 解析失败时的兜底。
 
 ## 架构要点
 
@@ -37,7 +37,7 @@ CI 在 Windows/Linux/macOS 三平台跑。发布：推 `v*` 标签即触发 `rel
   汇入 `AppEvent` mpsc 通道，主循环逐个应用后重绘。任何网络/IPC 都必须
   `tokio::spawn` 后经通道回流，**严禁阻塞主循环**。
 - **播放**：`player/mpv_ipc.rs` spawn `mpv --no-video --idle` 子进程，JSON IPC
-  （Windows 命名管道 `\\.\pipe\ytbm-mpv-{pid}`）。曲目结束只认 `end-file` 事件的
+  （Windows 命名管道 `\\.\pipe\nakuru-mpv-{pid}`）。曲目结束只认 `end-file` 事件的
   `reason=eof`；`stop/quit` 是我们自己触发的，忽略。`player/native.rs` 使用
   rodio/CPAL，MP4/AAC 压缩音频预缓冲约 1 MiB 后，从匿名临时文件边下载边解码；
   单首大小上限 512 MiB。稀疏临时文件支持远端分段优先下载；带完整 `sidx` 的碎片 MP4
@@ -103,4 +103,4 @@ CI 在 Windows/Linux/macOS 三平台跑。发布：推 `v*` 标签即触发 `rel
 - Windows 专项：spawn 子进程一律加 `CREATE_NO_WINDOW`；按键只处理
   `KeyEventKind::Press`（Windows 会送 Release）。
 - TUI 期间禁止任何 stdout/stderr 输出，诊断走 tracing 文件日志
-  （`%APPDATA%\ytbm-tui\ytbm-tui.log`）。
+  （`%APPDATA%\NakuruMusic\data\nakuru-music.log`；旧安装沿用旧数据目录）。

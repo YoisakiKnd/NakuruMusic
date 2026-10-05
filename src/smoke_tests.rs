@@ -11,14 +11,14 @@ use crate::api::{MusicApi, StreamFormat};
 
 fn api() -> Arc<dyn MusicApi> {
     let dir = std::env::temp_dir()
-        .join("ytbm-tui-smoke")
+        .join("nakuru-music-smoke")
         .join("rustypipe");
     Arc::new(RustyPipeApi::new(dir).expect("init rustypipe"))
 }
 
 fn http() -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("ytbm-tui-smoke/0.1")
+        .user_agent("nakuru-music-smoke/0.2")
         .build()
         .unwrap()
 }
@@ -114,7 +114,7 @@ async fn resolve_and_fetch_stream() {
     assert!(!bytes.is_empty(), "stream returned no data");
 }
 
-/// Whole-track check of the default mpv path using the same resolved direct
+/// Whole-track check of the optional mpv path using the same resolved direct
 /// URL as the application. Requires YTBM_TEST_MPV to point to an mpv binary.
 #[tokio::test]
 #[ignore = "requires YTBM_TEST_MPV, network access and a complete YouTube stream"]
@@ -278,7 +278,7 @@ async fn browser_cookie_import_plumbing() {
         "no browser profile yielded a usable YouTube credential"
     );
     // The reader must not leave its private temporary directory behind.
-    let prefix = format!("ytbm-cookie-{}-", std::process::id());
+    let prefix = format!("nakuru-cookie-{}-", std::process::id());
     let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
         .map(|it| {
             it.filter_map(Result::ok)
