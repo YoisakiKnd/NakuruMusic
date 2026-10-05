@@ -1,13 +1,13 @@
-# ytbm-tui
+# NakuruMusic
 
-[![CI](https://github.com/YoisakiKnd/ytbm-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/YoisakiKnd/ytbm-tui/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/YoisakiKnd/ytbm-tui)](https://github.com/YoisakiKnd/ytbm-tui/releases/latest)
+[![CI](https://github.com/YoisakiKnd/NakuruMusic/actions/workflows/ci.yml/badge.svg)](https://github.com/YoisakiKnd/NakuruMusic/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/YoisakiKnd/NakuruMusic)](https://github.com/YoisakiKnd/NakuruMusic/releases/latest)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
-轻量级 YouTube Music 终端客户端（TUI）。可使用内置音频后端或 mpv 播放。
+轻量级 YouTube Music 终端客户端（TUI）。默认使用内置音频后端，也可在设置页切换到 mpv。界面采用以藍月なくる为灵感的浅蓝主题与渐变进度条；本项目为非官方作品。
 
 ```
- 首页 Esc  搜索 /  音乐库 L  历史 H  正在播放 l       ? 帮助  q 退出
+ 首页 Esc  搜索 /  音乐库 L  历史 H  正在播放 l  设置 ,   ? 帮助  q 退出
 ┌ 首页 ───────────────────────────────────────┬ 队列 12 ─────────┐
 │ 热门歌曲 ----------------------------------- │ > 晴天    周杰伦  │
 │ >  1 Golden              HUNTR/X       3:20 │   七里香  周杰伦  │
@@ -23,7 +23,7 @@
 
 ## 下载
 
-到 [Releases](https://github.com/YoisakiKnd/ytbm-tui/releases/latest) 下载对应平台的
+到 [Releases](https://github.com/YoisakiKnd/NakuruMusic/releases/latest) 下载对应平台的
 压缩包（Windows / Linux / macOS Intel / macOS Apple Silicon），解压即用。
 
 ## 特性
@@ -45,15 +45,32 @@
 
 ## 安装
 
-下载对应平台压缩包，解压后运行。首次启动会生成配置文件。当前默认使用 mpv，
-可通过 scoop 或 winget 安装：
+下载对应平台压缩包，解压后运行。首次启动会生成配置文件，默认使用内置播放器，
+无需 mpv 或 yt-dlp。
+
+Windows 可使用 Scoop：
+
+```powershell
+scoop bucket add yoisaki https://github.com/YoisakiKnd/scoop-bucket
+scoop install yoisaki/nakuru-music
+nakuru-music
+```
+
+macOS 可使用 Homebrew tap：
+
+```sh
+brew tap YoisakiKnd/tap
+brew install --cask nakuru-music
+nakuru-music
+```
+
+按 `,` 打开设置页，选中 mpv 并按 Enter，可在运行时切换。mpv 需预先安装：
 
 ```powershell
 scoop install mpv
 ```
 
-不安装 mpv 时，可在配置文件的 `[playback]` 下设置 `engine = "native"`，
-试用内置 MP4/AAC 播放器。这个模式先预缓冲约 1 MiB 压缩音频，
+内置 MP4/AAC 播放器先预缓冲约 1 MiB 压缩音频，
 再从匿名临时文件边下载边解码；单曲临时文件上限为 512 MiB。
 网络慢时播放会等待后续数据；快进到尚未下载的位置会取消当前分段并优先请求目标分段，仍需等待网络响应。切歌或退出后
 临时文件会关闭并删除。对带完整片段索引的 MP4，三小时线上 AAC 已实测快速启动、跳到两小时处及跳回开头；
@@ -73,7 +90,7 @@ scoop install mpv
 
 ```powershell
 cargo build --release
-# 产物: target\release\ytbm-tui.exe，单文件可任意拷贝
+# 产物: target\release\nakuru-music.exe，单文件可任意拷贝
 ```
 
 ## 开发
@@ -88,8 +105,9 @@ CI（`.github/workflows/ci.yml`）在三大平台跑 fmt + clippy + test + relea
 推送 `v*` 标签会触发 `release.yml` 交叉构建四个平台产物并自动创建 GitHub Release。
 项目约定见 [CLAUDE.md](CLAUDE.md)。
 
-实机测试时可设置 `YTBM_DATA_ROOT` 为绝对路径，将配置、缓存和会话文件写入该目录，
+实机测试时可设置 `NAKURU_MUSIC_DATA_ROOT` 为绝对路径，将配置、缓存和会话文件写入该目录，
 便于使用独立测试资料且不改动日常使用的配置。
+旧版的 `YTBM_DATA_ROOT` 仍可使用；升级后会继续读取旧版数据目录，不迁移或删除登录与历史数据。
 
 ## 登录（访问个人音乐库）
 
@@ -126,6 +144,7 @@ Chrome 自身进程，外部程序无法解密**。Firefox 和 Waterfox 的 Cook
 | `/` | 搜索 |
 | `L` | 音乐库（登录入口） |
 | `H` | 本地播放历史 |
+| `,` | 设置 / 切换播放器 |
 | `1-4` / `[` `]` | 搜索分类切换（歌曲/专辑/歌手/歌单） |
 | `j/k` `↑/↓` `PgUp/PgDn` `g/G` | 列表导航 |
 | `Enter` | 播放（当前列表从这首起顺序播放）/ 打开；历史页重新播放选中歌曲 |
@@ -148,11 +167,11 @@ Chrome 自身进程，外部程序无法解密**。Firefox 和 Waterfox 的 Cook
 
 ## 配置
 
-首次运行自动生成 `%APPDATA%\ytbm-tui\config\config.toml`：
+首次运行自动生成 `%APPDATA%\NakuruMusic\config\config.toml`；旧版安装沿用 `%APPDATA%\ytbm-tui`：
 
 ```toml
 [playback]
-engine = "mpv"       # "native" 使用进程内 AAC 播放器，跨平台验收仍在进行
+engine = "native"    # 默认内置播放器；也可在设置页切换 mpv
 mpv_path = "mpv"     # 自动发现失败时可写绝对路径
 volume = 70
 radio_auto = true
@@ -167,10 +186,10 @@ enabled = true
 [keys]           # 全局键位可重映射（列表内导航键固定）
 # next = "b"     # 动作名: quit/search/library/help/focus/play_pause/mute/next/
 # vol_up = "]"   #   prev/seek_back/seek_fwd/vol_down/vol_up/repeat/radio/
-                 #   shuffle/lyrics/restart_player/history
+                 #   shuffle/lyrics/restart_player/history/settings
 ```
 
-日志：`%APPDATA%\ytbm-tui\data\ytbm-tui.log`（TUI 模式下所有诊断信息写入文件）。
+日志：`%APPDATA%\NakuruMusic\data\nakuru-music.log`（旧安装仍使用旧数据目录）。
 
 ## 故障排查
 

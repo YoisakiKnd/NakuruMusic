@@ -73,7 +73,7 @@ async fn run_on_device(
     sink.set_volume(volume as f32 / 100.0);
 
     let http = match reqwest::Client::builder()
-        .user_agent(concat!("ytbm-tui/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("nakuru-music/", env!("CARGO_PKG_VERSION")))
         .build()
     {
         Ok(http) => http,
@@ -1312,7 +1312,7 @@ mod tests {
         assert!(url.starts_with("https://"));
 
         let client = reqwest::Client::builder()
-            .user_agent(concat!("ytbm-tui/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("nakuru-music/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap();
 
@@ -1348,7 +1348,7 @@ mod tests {
             .unwrap();
         assert!(songs.tracks.len() >= 3);
         let client = reqwest::Client::builder()
-            .user_agent(concat!("ytbm-tui/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("nakuru-music/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap();
 
@@ -1393,7 +1393,7 @@ mod tests {
             .unwrap();
         assert!(songs.tracks.len() >= 5);
         let client = reqwest::Client::builder()
-            .user_agent(concat!("ytbm-tui/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("nakuru-music/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap();
 
@@ -1521,7 +1521,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let api = RustyPipeApi::new(dir.path().join("rustypipe")).unwrap();
         let client = reqwest::Client::builder()
-            .user_agent(concat!("ytbm-tui/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("nakuru-music/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap();
         for query in ["1 hour relaxing piano music", "2 hour classical music"] {

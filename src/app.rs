@@ -29,7 +29,15 @@ pub enum AppEvent {
     Paste(String),
     Resize,
     Tick,
-    Player(PlayerEvent),
+    Player {
+        epoch: u64,
+        event: PlayerEvent,
+    },
+    EngineChecked {
+        engine: PlaybackEngine,
+        mpv_path: Option<String>,
+        ytdlp_path: Option<String>,
+    },
     Api(ApiMsg),
 }
 
@@ -133,6 +141,7 @@ pub enum Action {
     LyricsToggle,
     RestartPlayer,
     History,
+    Settings,
 }
 
 /// (action, config name, default key)
@@ -156,6 +165,7 @@ const DEFAULT_KEYS: &[(Action, &str, KeyCode)] = &[
     (Action::LyricsToggle, "lyrics", KeyCode::Char('l')),
     (Action::RestartPlayer, "restart_player", KeyCode::Char('R')),
     (Action::History, "history", KeyCode::Char('H')),
+    (Action::Settings, "settings", KeyCode::Char(',')),
 ];
 
 /// Download and decode album art. Failures are silent - a missing cover
@@ -299,6 +309,7 @@ pub enum MainView {
     NowPlaying,
     Library,
     History,
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,7 +509,11 @@ pub struct App {
     pub pb: PlaybackState,
     /// Set when the user asks to restart a dead player; main re-wires it.
     pub player_restart_requested: bool,
+    pub player_epoch: u64,
     restart_pending_track: bool,
+    restart_resume_paused: bool,
+    pub settings_selected: usize,
+    pub engine_switch_pending: bool,
     pub status: Option<String>,
     status_ttl: u8,
     pub detail_retry_hint: Option<String>,
@@ -507,6 +522,7 @@ pub struct App {
     pub http: reqwest::Client,
     /// Scratch space for the browser cookie export.
     data_dir: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
     tx: mpsc::UnboundedSender<AppEvent>,
 
     pub focus: Focus,
@@ -604,6 +620,7 @@ impl App {
         api: Arc<dyn MusicApi>,
         http: reqwest::Client,
         data_dir: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
         picker: Option<ratatui_image::picker::Picker>,
         tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Self {
@@ -626,13 +643,18 @@ impl App {
                 alive: false,
             },
             player_restart_requested: false,
+            player_epoch: 0,
             restart_pending_track: false,
+            restart_resume_paused: false,
+            settings_selected: 0,
+            engine_switch_pending: false,
             status: None,
             status_ttl: 0,
             detail_retry_hint: None,
             api,
             http,
             data_dir,
+            config_dir,
             tx,
             focus: Focus::Main,
             main_view: MainView::Home,
@@ -893,7 +915,19 @@ impl App {
                 self.maybe_persist();
                 return redraw;
             }
-            AppEvent::Player(pe) => self.on_player_event(pe),
+            AppEvent::Player { epoch, event } => {
+                if epoch != self.player_epoch {
+                    return false;
+                }
+                self.on_player_event(event);
+            }
+            AppEvent::EngineChecked {
+                engine,
+                mpv_path,
+                ytdlp_path,
+            } => {
+                self.finish_engine_switch(engine, mpv_path, ytdlp_path);
+            }
             AppEvent::Api(msg) => self.on_api_msg(msg),
         }
         true
@@ -1107,6 +1141,8 @@ impl App {
                 }
             }
             PlayerEvent::InitFailed(e) => {
+                self.restart_pending_track = false;
+                self.restart_resume_paused = false;
                 self.track_tasks.abort();
                 self.pb.alive = false;
                 self.pb.loading = false;
@@ -1145,6 +1181,10 @@ impl App {
                 if let Some(position) = self.resume_position.take() {
                     self.player.send(PlayerCmd::SeekAbs(position));
                     self.pb.time_pos = position;
+                }
+                if self.restart_resume_paused {
+                    self.restart_resume_paused = false;
+                    self.player.send(PlayerCmd::TogglePause);
                 }
             }
             TrackEvent::TimePos(t) => {
@@ -1742,6 +1782,7 @@ impl App {
                 MainView::Home => self.on_home_key(key),
                 MainView::Library => self.on_library_key(key),
                 MainView::History => self.on_history_key(key),
+                MainView::Settings => self.on_settings_key(key),
             },
         }
     }
@@ -1816,6 +1857,7 @@ impl App {
             Action::RestartPlayer => {
                 if !self.pb.alive {
                     self.restart_pending_track = self.current_video_id.is_some();
+                    self.player_epoch = self.player_epoch.wrapping_add(1);
                     self.player_restart_requested = true;
                 }
             }
@@ -1823,7 +1865,96 @@ impl App {
                 self.focus = Focus::Main;
                 self.main_view = MainView::History;
             }
+            Action::Settings => {
+                self.focus = Focus::Main;
+                self.main_view = MainView::Settings;
+                self.settings_selected =
+                    usize::from(self.config.playback.engine == PlaybackEngine::Mpv);
+            }
         }
+    }
+
+    fn on_settings_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('1') => self.settings_selected = 0,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('2') => self.settings_selected = 1,
+            KeyCode::Enter => self.begin_engine_switch(),
+            KeyCode::Esc => self.main_view = MainView::Home,
+            _ => {}
+        }
+    }
+
+    fn begin_engine_switch(&mut self) {
+        let engine = if self.settings_selected == 0 {
+            PlaybackEngine::Native
+        } else {
+            PlaybackEngine::Mpv
+        };
+        if engine == self.config.playback.engine || self.engine_switch_pending {
+            return;
+        }
+        self.engine_switch_pending = true;
+        self.toast(if engine == PlaybackEngine::Mpv {
+            "正在检查 mpv.."
+        } else {
+            "正在切换到内置播放器.."
+        });
+        let tx = self.tx.clone();
+        let configured = self.config.playback.mpv_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mpv_path = if engine == PlaybackEngine::Mpv {
+                crate::config::resolve_tool(&configured, "mpv", "mpv")
+            } else {
+                None
+            };
+            let ytdlp_path = if mpv_path.is_some() {
+                crate::config::resolve_tool("yt-dlp", "yt-dlp", "yt-dlp")
+            } else {
+                None
+            };
+            let _ = tx.send(AppEvent::EngineChecked {
+                engine,
+                mpv_path,
+                ytdlp_path,
+            });
+        });
+    }
+
+    fn finish_engine_switch(
+        &mut self,
+        engine: PlaybackEngine,
+        mpv_path: Option<String>,
+        ytdlp_path: Option<String>,
+    ) {
+        if !self.engine_switch_pending {
+            return;
+        }
+        self.engine_switch_pending = false;
+        if engine == PlaybackEngine::Mpv && mpv_path.is_none() {
+            self.toast("未找到 mpv。请先安装，或在配置中设置 mpv_path");
+            return;
+        }
+        if let Err(e) = crate::config::save_engine(&self.config_dir, engine) {
+            self.toast(format!("保存播放器设置失败: {e}"));
+            return;
+        }
+        self.config.playback.engine = engine;
+        if let Some(path) = mpv_path {
+            self.config.playback.mpv_path = path;
+        }
+        self.config.ytdlp_path = ytdlp_path;
+        self.restart_pending_track = self.current_video_id.is_some();
+        self.restart_resume_paused = self.pb.paused;
+        self.track_tasks.abort();
+        self.player.send(PlayerCmd::Shutdown);
+        self.player_epoch = self.player_epoch.wrapping_add(1);
+        self.player_restart_requested = true;
+        self.pb.alive = false;
+        self.toast(if engine == PlaybackEngine::Native {
+            "已切换到内置播放器"
+        } else {
+            "已切换到 mpv"
+        });
     }
 
     fn on_input_key(&mut self, key: KeyEvent) {
@@ -2258,6 +2389,18 @@ impl App {
             }
         }
 
+        if self.main_view == MainView::Settings {
+            for (i, row) in layout.settings_rows.iter().enumerate() {
+                if row.is_some_and(|area| area.contains(pos)) {
+                    self.settings_selected = i;
+                    if double {
+                        self.begin_engine_switch();
+                    }
+                    return;
+                }
+            }
+        }
+
         // Progress bar → seek to the clicked ratio.
         if let Some(g) = layout.gauge {
             if g.contains(pos) && self.pb.duration > 0.0 {
@@ -2646,6 +2789,65 @@ mod tests {
     use ratatui::crossterm::event::KeyModifiers;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn settings_reject_missing_mpv_and_ignore_old_player_events() {
+        let (mut app, _) = test_app();
+        app.on_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE));
+        assert_eq!(app.main_view, MainView::Settings);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.settings_selected, 1);
+        app.engine_switch_pending = true;
+        app.finish_engine_switch(PlaybackEngine::Mpv, None, None);
+        assert_eq!(app.config.playback.engine, PlaybackEngine::Native);
+        assert!(!app.player_restart_requested);
+
+        app.pb.alive = true;
+        app.player_epoch = 2;
+        assert!(!app.handle(AppEvent::Player {
+            epoch: 1,
+            event: PlayerEvent::Died
+        }));
+        assert!(app.pb.alive);
+    }
+
+    #[tokio::test]
+    async fn switching_engine_saves_choice_and_resumes_current_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, mut commands) = test_app();
+        app.config_dir = tmp.path().to_path_buf();
+        app.queue.set_context(vec![track("current")], 0);
+        app.current_video_id = Some("current".into());
+        app.pb.time_pos = 42.0;
+        app.pb.paused = true;
+        app.engine_switch_pending = true;
+
+        app.finish_engine_switch(PlaybackEngine::Mpv, Some("/fake/mpv".into()), None);
+        assert_eq!(app.config.playback.engine, PlaybackEngine::Mpv);
+        assert_eq!(
+            crate::config::load(&crate::config::Dirs {
+                config_dir: tmp.path().to_path_buf(),
+                data_dir: tmp.path().to_path_buf(),
+            })
+            .unwrap()
+            .playback
+            .engine,
+            PlaybackEngine::Mpv
+        );
+        assert!(app.player_restart_requested);
+        assert_eq!(app.player_epoch, 1);
+        assert!(matches!(commands.try_recv(), Ok(PlayerCmd::Shutdown)));
+
+        app.on_player_event(PlayerEvent::Ready);
+        assert_eq!(app.resume_position, Some(42.0));
+        app.load_requested = true;
+        app.on_track_event(TrackEvent::FileLoaded);
+        let sent: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(sent
+            .iter()
+            .any(|cmd| matches!(cmd, PlayerCmd::SeekAbs(t) if *t == 42.0)));
+        assert!(sent.iter().any(|cmd| matches!(cmd, PlayerCmd::TogglePause)));
+    }
+
     struct TestApi;
 
     #[async_trait::async_trait]
@@ -2723,6 +2925,7 @@ mod tests {
             player,
             Arc::new(TestApi),
             reqwest::Client::new(),
+            std::env::temp_dir(),
             std::env::temp_dir(),
             None,
             tx,
@@ -3010,6 +3213,7 @@ mod tests {
             Arc::new(TestApi),
             reqwest::Client::new(),
             std::env::temp_dir(),
+            std::env::temp_dir(),
             None,
             app_tx,
         );
@@ -3141,7 +3345,12 @@ mod tests {
         app.search.results.tracks = (0..40).map(|i| track(&format!("s{i}"))).collect();
         for (width, height) in [(40, 12), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            for view in [MainView::Home, MainView::Search, MainView::NowPlaying] {
+            for view in [
+                MainView::Home,
+                MainView::Search,
+                MainView::NowPlaying,
+                MainView::Settings,
+            ] {
                 app.main_view = view;
                 app.focus = Focus::Queue;
                 terminal

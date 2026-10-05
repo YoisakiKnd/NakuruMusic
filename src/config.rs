@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use directories::ProjectDirs;
@@ -55,15 +55,15 @@ pub struct Playback {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaybackEngine {
-    #[default]
     Mpv,
+    #[default]
     Native,
 }
 
 impl Default for Playback {
     fn default() -> Self {
         Self {
-            engine: PlaybackEngine::Mpv,
+            engine: PlaybackEngine::Native,
             mpv_path: "mpv".into(),
             volume: 70,
             radio_auto: true,
@@ -197,22 +197,39 @@ pub fn probe_version(exe: &str) -> bool {
 }
 
 pub fn project_dirs() -> Result<Dirs> {
-    if let Some(root) = std::env::var_os("YTBM_DATA_ROOT").filter(|value| !value.is_empty()) {
+    if let Some(root) = std::env::var_os("NAKURU_MUSIC_DATA_ROOT")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("YTBM_DATA_ROOT").filter(|value| !value.is_empty()))
+    {
         let root = PathBuf::from(root);
         if !root.is_absolute() {
-            bail!("YTBM_DATA_ROOT 必须是绝对路径");
+            bail!("NAKURU_MUSIC_DATA_ROOT 必须是绝对路径");
         }
         return Ok(Dirs {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
         });
     }
-    let pd = ProjectDirs::from("", "", "ytbm-tui")
+    let pd = ProjectDirs::from("", "", "NakuruMusic")
         .context("cannot determine platform config directory")?;
-    Ok(Dirs {
+    let new_dirs = Dirs {
         config_dir: pd.config_dir().to_path_buf(),
         data_dir: pd.data_dir().to_path_buf(),
-    })
+    };
+    if new_dirs.config_dir.exists() || new_dirs.data_dir.exists() {
+        return Ok(new_dirs);
+    }
+    // Existing installs keep their config, library login and play history in
+    // place. Fresh installs use NakuruMusic directories.
+    if let Some(old) = ProjectDirs::from("", "", "ytbm-tui") {
+        if old.config_dir().exists() || old.data_dir().exists() {
+            return Ok(Dirs {
+                config_dir: old.config_dir().to_path_buf(),
+                data_dir: old.data_dir().to_path_buf(),
+            });
+        }
+    }
+    Ok(new_dirs)
 }
 
 /// Load config.toml from the platform config dir; write a commented default
@@ -231,10 +248,27 @@ pub fn load(dirs: &Dirs) -> Result<Config> {
     Ok(cfg)
 }
 
-const DEFAULT_CONFIG_TOML: &str = r#"# ytbm-tui 配置文件
+/// Change just the engine setting, preserving user comments and other keys.
+pub fn save_engine(config_dir: &Path, engine: PlaybackEngine) -> Result<()> {
+    let path = config_dir.join("config.toml");
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG_TOML.to_owned(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut doc = source.parse::<toml_edit::DocumentMut>()?;
+    doc["playback"]["engine"] = toml_edit::value(match engine {
+        PlaybackEngine::Native => "native",
+        PlaybackEngine::Mpv => "mpv",
+    });
+    crate::atomic_file::write(&path, doc.to_string().as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+const DEFAULT_CONFIG_TOML: &str = r#"# NakuruMusic 配置文件
 
 [playback]
-engine = "mpv"      # "native" 使用内置 AAC 播放器，无需 mpv；跨平台兼容性仍在验证
+engine = "native"   # 默认内置 AAC 播放器；可在设置页切换到 mpv
 mpv_path = "mpv"     # mpv 不在 PATH 时可写绝对路径
 volume = 70
 radio_auto = true    # 队列快播完时自动补充电台歌曲
@@ -249,7 +283,7 @@ enabled = true
 [keys]
 # 可选全局键位覆盖。可用动作名:
 #   quit, search, help, focus, play_pause, next, prev, seek_back, seek_fwd,
-#   vol_down, vol_up, repeat, radio, shuffle, lyrics, restart_player
+#   vol_down, vol_up, repeat, radio, shuffle, lyrics, restart_player, settings
 # 取值: 单个字符, 或 space/tab/enter/esc/left/right/up/down
 # 示例:
 # next = "b"
@@ -261,6 +295,25 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn default_engine_is_native_and_setting_preserves_custom_config() {
+        assert_eq!(Config::default().playback.engine, PlaybackEngine::Native);
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config_dir: tmp.path().join("config"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        let path = dirs.config_dir.join("config.toml");
+        std::fs::write(&path, "# My settings\n[playback]\nengine = 'native' # chosen\nvolume = 29\n[extra]\nvalue = 1\n").unwrap();
+        save_engine(&dirs.config_dir, PlaybackEngine::Mpv).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# My settings"));
+        assert!(text.contains("[extra]"));
+        assert_eq!(load(&dirs).unwrap().playback.engine, PlaybackEngine::Mpv);
+        assert_eq!(load(&dirs).unwrap().playback.volume, 29);
+    }
 
     #[test]
     fn hung_tool_probe_times_out() {

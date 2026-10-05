@@ -1,8 +1,8 @@
 [package]
-name = "ytbm-tui"
-version = "0.1.2"
+name = "nakuru-music"
+version = "0.2.0"
 edition = "2021"
-description = "Lightweight YouTube Music TUI client with native and mpv playback"
+description = "NakuruMusic, a lightweight YouTube Music TUI with built-in playback"
 license = "GPL-3.0-only"
 
 [dependencies]
@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+toml_edit = "0.22.27"
 directories = "6"
 anyhow = "1"
 thiserror = "2"

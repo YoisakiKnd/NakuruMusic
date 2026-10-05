@@ -5,8 +5,10 @@ mod library;
 mod now_playing;
 mod overlay;
 mod player_bar;
+mod progress;
 mod queue;
 mod search;
+mod settings;
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -27,18 +29,20 @@ pub struct UiLayout {
     pub queue_pane: Option<Rect>,
     pub queue_list: Option<(Rect, usize)>,
     pub gauge: Option<Rect>,
+    pub settings_rows: [Option<Rect>; 2],
     /// Clickable areas of the top navigation bar.
     pub nav_tabs: [Option<(Rect, MainView)>; NAV_TABS.len()],
 }
 
 /// Top-level destinations, with the key that reaches them. Showing the keys
 /// in the bar is what makes them discoverable — there is no menu otherwise.
-pub const NAV_TABS: [(&str, &str, MainView); 5] = [
+pub const NAV_TABS: [(&str, &str, MainView); 6] = [
     ("首页", "Esc", MainView::Home),
     ("搜索", "/", MainView::Search),
     ("音乐库", "L", MainView::Library),
     ("历史", "H", MainView::History),
     ("正在播放", "l", MainView::NowPlaying),
+    ("设置", ",", MainView::Settings),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +54,7 @@ pub enum MainListKind {
     History,
 }
 
-pub const ACCENT: Color = Color::Red; // YouTube-ish accent
+pub const ACCENT: Color = Color::Rgb(117, 204, 232);
 pub const DIM: Color = Color::DarkGray;
 
 /// Item-type badges.
@@ -273,8 +277,8 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) -> [Option<(Rect, MainView)>; 
     let mut hits: [Option<(Rect, MainView)>; NAV_TABS.len()] = Default::default();
     let mut spans = Vec::new();
     let mut x = area.x;
-    let compact = area.width < 70;
-    let compact_labels = ["首页", "搜索", "库", "史", "播"];
+    let compact = area.width < 96;
+    let compact_labels = ["首页", "搜索", "库", "史", "播", "设"];
     let hint = if compact {
         format!(
             "{} {}",
@@ -300,6 +304,7 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) -> [Option<(Rect, MainView)>; 
             MainView::Library => app.key_label(Action::Library),
             MainView::History => app.key_label(Action::History),
             MainView::NowPlaying => app.key_label(Action::LyricsToggle),
+            MainView::Settings => app.key_label(Action::Settings),
             _ => (*key).to_string(),
         };
         let text = if compact {
@@ -385,6 +390,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect, layout: &mut UiLayout) {
         MainView::NowPlaying => " 正在播放 ",
         MainView::Library => " 音乐库 ",
         MainView::History => " 播放历史 ",
+        MainView::Settings => " 设置 ",
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -431,6 +437,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect, layout: &mut UiLayout) {
                 layout.main_list = Some((MainListKind::History, hit.0, hit.1));
             }
         }
+        MainView::Settings => layout.settings_rows = settings::draw(f, app, inner),
     }
 }
 

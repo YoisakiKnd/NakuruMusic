@@ -8,7 +8,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, LineGauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui_image::{Resize, StatefulImage};
 
@@ -210,14 +210,7 @@ fn draw_progress(f: &mut Frame, app: &App, area: Rect) {
     } else {
         0.0
     };
-    f.render_widget(
-        LineGauge::default()
-            .ratio(ratio)
-            .label(Span::raw(""))
-            .filled_style(Style::default().fg(ACCENT))
-            .unfilled_style(Style::default().fg(DIM)),
-        gauge_a,
-    );
+    super::progress::draw(f, gauge_a, ratio);
     f.render_widget(
         Paragraph::new(label).style(Style::default().fg(DIM)),
         time_a,

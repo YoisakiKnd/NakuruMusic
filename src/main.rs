@@ -14,7 +14,7 @@ mod ui;
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use app::{App, AppEvent};
 use ratatui::crossterm::event::{Event, KeyEventKind};
 use tokio::sync::mpsc;
@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     // File logging - the TUI owns the terminal, so nothing may print to it.
     std::fs::create_dir_all(&dirs.data_dir)?;
     let (log_writer, _log_guard) = tracing_appender::non_blocking(
-        tracing_appender::rolling::never(&dirs.data_dir, "ytbm-tui.log"),
+        tracing_appender::rolling::never(&dirs.data_dir, "nakuru-music.log"),
     );
     tracing_subscriber::fmt()
         .with_writer(log_writer)
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
     result
 }
 
-/// mpv is required only for the mpv backend. yt-dlp is optional: stream URLs
+/// mpv is checked only for the mpv backend; absence falls back to native playback. yt-dlp is optional: stream URLs
 /// are resolved in-process, and it can serve as mpv's fallback resolver.
 /// Both tools are located beyond PATH (scoop/winget dirs) so a terminal
 /// opened before installation still works.
@@ -92,10 +92,12 @@ fn preflight(cfg: &mut config::Config) -> Result<Option<String>> {
                 info!("mpv resolved: {path}");
                 cfg.playback.mpv_path = path;
             }
-            None => bail!(
-                "未检测到 mpv（已尝试 PATH、scoop、Program Files）。\n\n\
-                 请安装 mpv，或在配置文件 [playback] 中设置 engine = \"native\" 使用内置播放器。"
-            ),
+            None => {
+                cfg.playback.engine = config::PlaybackEngine::Native;
+                return Ok(Some(
+                    "未检测到 mpv，本次使用内置播放器；按 , 打开设置页切换".into(),
+                ));
+            }
         }
         // Only mpv can use this fallback. Native playback never probes or
         // starts either external executable.
@@ -120,14 +122,14 @@ async fn run(
 
     spawn_input_thread(tx.clone());
     spawn_tick_task(tx.clone());
-    let player = wire_player(&cfg, tx.clone());
+    let player = wire_player(&cfg, tx.clone(), 0);
 
     let dirs = config::project_dirs()?;
     let api: Arc<dyn api::MusicApi> = Arc::new(api::rustypipe::RustyPipeApi::new(
         dirs.data_dir.join("rustypipe"),
     )?);
     let http = reqwest::Client::builder()
-        .user_agent(concat!("ytbm-tui/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("nakuru-music/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     let app = App::new(
@@ -136,6 +138,7 @@ async fn run(
         api,
         http,
         dirs.data_dir.clone(),
+        dirs.config_dir.clone(),
         picker,
         tx.clone(),
     );
@@ -145,7 +148,7 @@ async fn run(
     app.on_start();
     match startup_warning {
         Some(w) => app.toast(w),
-        None => app.toast("欢迎使用 ytbm-tui - / 搜索 - L 音乐库 - ? 帮助"),
+        None => app.toast("欢迎使用 NakuruMusic - / 搜索 - , 设置 - ? 帮助"),
     }
 
     let mut redraw = true;
@@ -163,8 +166,9 @@ async fn run(
         }
         if app.player_restart_requested {
             app.player_restart_requested = false;
-            app.player = wire_player(&app.config, tx.clone());
-            app.toast("正在重启播放器..");
+            app.player.send(player::PlayerCmd::Shutdown);
+            app.player = wire_player(&app.config, tx.clone(), app.player_epoch);
+            app.toast("正在启动播放器..");
             redraw = true;
         }
     }
@@ -180,7 +184,11 @@ async fn run(
 }
 
 /// Spawn the player task and bridge its events into the app channel.
-fn wire_player(cfg: &config::Config, tx: mpsc::UnboundedSender<AppEvent>) -> player::PlayerHandle {
+fn wire_player(
+    cfg: &config::Config,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    epoch: u64,
+) -> player::PlayerHandle {
     let (pev_tx, mut pev_rx) = mpsc::unbounded_channel::<player::PlayerEvent>();
     let handle = match cfg.playback.engine {
         config::PlaybackEngine::Mpv => player::spawn_player(
@@ -193,7 +201,7 @@ fn wire_player(cfg: &config::Config, tx: mpsc::UnboundedSender<AppEvent>) -> pla
     };
     tokio::spawn(async move {
         while let Some(pe) = pev_rx.recv().await {
-            if tx.send(AppEvent::Player(pe)).is_err() {
+            if tx.send(AppEvent::Player { epoch, event: pe }).is_err() {
                 break;
             }
         }

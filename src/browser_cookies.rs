@@ -383,7 +383,10 @@ fn cleanup_stale_scratch_in(root: &Path, max_age: Duration) -> usize {
 }
 
 fn scratch_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("ytbm-cookie-") else {
+    let Some(rest) = name
+        .strip_prefix("nakuru-cookie-")
+        .or_else(|| name.strip_prefix("ytbm-cookie-"))
+    else {
         return false;
     };
     let Some((pid, nonce)) = rest.split_once('-') else {
@@ -399,7 +402,7 @@ impl CookieScratchDir {
     fn new() -> Result<Self> {
         for _ in 0..8 {
             let path = std::env::temp_dir().join(format!(
-                "ytbm-cookie-{}-{:016x}",
+                "nakuru-cookie-{}-{:016x}",
                 std::process::id(),
                 rand::random::<u64>()
             ));
@@ -735,16 +738,19 @@ mod tests {
     fn stale_cleanup_only_removes_matching_directories() {
         let root = tempfile::tempdir().unwrap();
         let stale = root.path().join("ytbm-cookie-123-0123456789abcdef");
+        let new_stale = root.path().join("nakuru-cookie-123-0123456789abcdef");
         let unrelated = root.path().join("ytbm-cookie-unrelated");
         std::fs::create_dir(&stale).unwrap();
+        std::fs::create_dir(&new_stale).unwrap();
         std::fs::create_dir(&unrelated).unwrap();
         assert_eq!(
             cleanup_stale_scratch_in(root.path(), Duration::from_secs(3600)),
             0
         );
         std::thread::sleep(Duration::from_millis(25));
-        assert_eq!(cleanup_stale_scratch_in(root.path(), Duration::ZERO), 1);
+        assert_eq!(cleanup_stale_scratch_in(root.path(), Duration::ZERO), 2);
         assert!(!stale.exists());
+        assert!(!new_stale.exists());
         assert!(unrelated.exists());
     }
 }
