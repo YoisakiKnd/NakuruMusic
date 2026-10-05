@@ -60,7 +60,7 @@ macOS 可使用 Homebrew tap：
 
 ```sh
 brew tap YoisakiKnd/tap
-brew install --cask nakuru-music
+brew install nakuru-music
 nakuru-music
 ```
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Scoop and Homebrew Cask manifests from verified release archives."""
+"""Generate Scoop and Homebrew Formula manifests from verified release archives."""
 
 import argparse
 import hashlib
@@ -73,26 +73,37 @@ def main() -> None:
             }
         },
     }
-    cask = f'''cask "nakuru-music" do
-  arch arm: "aarch64", intel: "x86_64"
-
-  version "{version}"
-  sha256 arm: "{archives['arm'][1]}", intel: "{archives['intel'][1]}"
-
-  url "{base}/releases/download/v#{{version}}/nakuru-music-v#{{version}}-#{{arch}}-apple-darwin.tar.gz"
-  name "NakuruMusic"
+    formula = f'''class NakuruMusic < Formula
   desc "YouTube Music terminal client with built-in audio playback"
   homepage "{base}"
+  version "{version}"
+  license "GPL-3.0-only"
 
-  binary "nakuru-music-v#{{version}}-#{{arch}}-apple-darwin/nakuru-music"
+  depends_on :macos
+
+  if Hardware::CPU.arm?
+    url "{release}/{archives['arm'][0]}"
+    sha256 "{archives['arm'][1]}"
+  else
+    url "{release}/{archives['intel'][0]}"
+    sha256 "{archives['intel'][1]}"
+  end
+
+  def install
+    bin.install Dir["**/nakuru-music"].fetch(0)
+  end
+
+  test do
+    assert_predicate bin/"nakuru-music", :executable?
+  end
 end
 '''
     (args.output / "bucket").mkdir(parents=True, exist_ok=True)
-    (args.output / "Casks").mkdir(parents=True, exist_ok=True)
+    (args.output / "Formula").mkdir(parents=True, exist_ok=True)
     (args.output / "bucket" / "nakuru-music.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=4) + "\n", encoding="utf-8"
     )
-    (args.output / "Casks" / "nakuru-music.rb").write_text(cask, encoding="utf-8")
+    (args.output / "Formula" / "nakuru-music.rb").write_text(formula, encoding="utf-8")
 
 
 if __name__ == "__main__":
