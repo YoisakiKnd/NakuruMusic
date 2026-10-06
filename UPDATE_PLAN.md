@@ -8,7 +8,8 @@
 - 修复 Windows 渐进缓存共享文件游标导致音频字节覆盖、AAC 解码失败和提前切歌的问题；读写使用独立句柄。
 - 提前结束和下载失败会限次重试当前曲目，恢复尝试先完成下载再解码；失败后保留当前曲目并提示 `R` 重试或 `n` 下一首。
 - Windows 原设备整曲播放、前台 TUI 与听感验收通过；修复提交的 Windows、Linux、macOS CI 均通过格式检查、Clippy、测试及 release 构建。
-- Release、Scoop 和 Homebrew 的 v0.2.2 发布正在进行。
+- [v0.2.2 Release](https://github.com/YoisakiKnd/NakuruMusic/releases/tag/v0.2.2) 已发布为最新正式版本；Windows、Linux、macOS 双架构安装包及 SHA256SUMS 已上传，四份归档的 SHA-256、程序、README 和许可证均已核验。
+- Scoop 与 Homebrew 已同步到 v0.2.2；Windows 实机通过 Scoop 下载正式包及哈希校验，Homebrew 公开 tap 的 [macOS CI](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/37416510599) 通过 `brew install`、`brew test`、可执行文件及无隔离标记检查。
 
 ## v0.2.0–v0.2.1：NakuruMusic 与分发
 
