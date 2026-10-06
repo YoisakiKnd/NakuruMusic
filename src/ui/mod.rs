@@ -357,7 +357,12 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) -> [Option<(Rect, MainView)>; 
 
 /// Transient messages get their own row instead of covering list content.
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let Some(msg) = app.status.as_ref().or(app.detail_retry_hint.as_ref()) else {
+    let Some(msg) = app
+        .status
+        .as_ref()
+        .or(app.playback_error.as_ref())
+        .or(app.detail_retry_hint.as_ref())
+    else {
         return;
     };
     f.render_widget(

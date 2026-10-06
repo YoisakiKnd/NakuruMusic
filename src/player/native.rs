@@ -102,7 +102,7 @@ async fn run_on_device(
             command = cmd_rx.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    PlayerCmd::Load { url, play_seq: next_seq } => {
+                    PlayerCmd::Load { url, play_seq: next_seq, wait_for_complete } => {
                         generation = generation.wrapping_add(1);
                         play_seq = next_seq;
                         if let Some(task) = downloader.take() { task.abort(); }
@@ -118,7 +118,7 @@ async fn run_on_device(
                         let client = http.clone();
                         let tx = download_tx.clone();
                         downloader = Some(tokio::spawn(async move {
-                            let result = download_audio(&client, &url, id, &tx).await;
+                            let result = download_audio(&client, &url, id, &tx, wait_for_complete).await;
                             let _ = tx.send(DownloadEvent::Finished(id, result.map_err(|e| format!("{e:#}"))));
                         }));
                     }
@@ -272,6 +272,7 @@ async fn download_audio(
     url: &str,
     id: u64,
     tx: &mpsc::UnboundedSender<DownloadEvent>,
+    wait_for_complete: bool,
 ) -> Result<()> {
     // Never include the signed URL in errors or logs: its query may contain
     // credentials. YouTube usually returns a few MiB per track.
@@ -284,21 +285,38 @@ async fn download_audio(
     if expected_total.is_some_and(|size| size > MAX_AUDIO_BYTES) {
         bail!("音频文件超过 {} MiB 限制", MAX_AUDIO_BYTES / 1024 / 1024);
     }
-    let shared = ProgressiveFile::new(tempfile::tempfile()?, expected_total);
+    let shared = ProgressiveFile::new(expected_total)?;
     let mut guard = WriterGuard::new(shared.clone());
     let mut writer = tokio::fs::File::from_std(shared.writer()?);
+    let ready = ReadySignal {
+        id,
+        tx,
+        wait_for_complete,
+    };
     let ready_sent = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-        download_ranged(client, url, response, &shared, &mut writer, id, tx).await?
+        download_ranged(client, url, response, &shared, &mut writer, &ready).await?
     } else {
-        download_linear(response, expected_total, &shared, &mut writer, id, tx).await?
+        download_linear(response, expected_total, &shared, &mut writer, &ready).await?
     };
     writer.flush().await?;
     drop(writer);
     guard.complete();
     if !ready_sent {
-        let _ = tx.send(DownloadEvent::Ready(id, shared.reader()));
+        ready.send(&shared);
     }
     Ok(())
+}
+
+struct ReadySignal<'a> {
+    id: u64,
+    tx: &'a mpsc::UnboundedSender<DownloadEvent>,
+    wait_for_complete: bool,
+}
+
+impl ReadySignal<'_> {
+    fn send(&self, shared: &Arc<ProgressiveFile>) {
+        let _ = self.tx.send(DownloadEvent::Ready(self.id, shared.reader()));
+    }
 }
 
 async fn download_linear(
@@ -306,8 +324,7 @@ async fn download_linear(
     expected_total: Option<u64>,
     shared: &Arc<ProgressiveFile>,
     writer: &mut tokio::fs::File,
-    id: u64,
-    tx: &mpsc::UnboundedSender<DownloadEvent>,
+    ready: &ReadySignal<'_>,
 ) -> Result<bool> {
     let mut written = 0_u64;
     let mut ready_sent = false;
@@ -323,8 +340,12 @@ async fn download_linear(
         writer.write_all(&chunk).await?;
         writer.flush().await?;
         shared.publish(written);
-        if !ready_sent && expected_total.is_some() && written >= PREBUFFER_BYTES {
-            let _ = tx.send(DownloadEvent::Ready(id, shared.reader()));
+        if !ready.wait_for_complete
+            && !ready_sent
+            && expected_total.is_some()
+            && written >= PREBUFFER_BYTES
+        {
+            ready.send(shared);
             ready_sent = true;
         }
     }
@@ -343,8 +364,7 @@ async fn download_ranged(
     mut response: reqwest::Response,
     shared: &Arc<ProgressiveFile>,
     writer: &mut tokio::fs::File,
-    id: u64,
-    tx: &mpsc::UnboundedSender<DownloadEvent>,
+    ready: &ReadySignal<'_>,
 ) -> Result<bool> {
     let total = response_total(&response, 0)?.expect("partial response has a total");
     if total == 0 {
@@ -409,8 +429,8 @@ async fn download_ranged(
             writer.flush().await?;
             complete[segment] = true;
             shared.publish_range(start, expected_end + 1);
-            if !ready_sent && segment == 0 {
-                let _ = tx.send(DownloadEvent::Ready(id, shared.reader()));
+            if !ready.wait_for_complete && !ready_sent && segment == 0 {
+                ready.send(shared);
                 ready_sent = true;
             }
             if complete.iter().all(|done| *done) {
@@ -532,7 +552,7 @@ mod tests {
     async fn downloads_to_seekable_temporary_file() {
         let url = serve_once(b"audio bytes", None).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        download_audio(&reqwest::Client::new(), &url, 7, &tx)
+        download_audio(&reqwest::Client::new(), &url, 7, &tx, false)
             .await
             .unwrap();
         let DownloadEvent::Ready(7, mut file) = rx.recv().await.unwrap() else {
@@ -548,7 +568,7 @@ mod tests {
     async fn rejects_oversized_audio_before_download() {
         let url = serve_once(b"", Some(MAX_AUDIO_BYTES + 1)).await;
         let (tx, _) = mpsc::unbounded_channel();
-        let error = download_audio(&reqwest::Client::new(), &url, 7, &tx)
+        let error = download_audio(&reqwest::Client::new(), &url, 7, &tx, false)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("512 MiB"));
@@ -580,10 +600,9 @@ mod tests {
                 .unwrap();
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task =
-            tokio::spawn(
-                async move { download_audio(&reqwest::Client::new(), &url, 9, &tx).await },
-            );
+        let task = tokio::spawn(async move {
+            download_audio(&reqwest::Client::new(), &url, 9, &tx, false).await
+        });
         let ready = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .unwrap()
@@ -592,6 +611,46 @@ mod tests {
         assert!(!task.is_finished());
         release_tx.send(()).unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a loopback TCP listener"]
+    async fn recovery_waits_for_complete_download_before_decoding() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (first_half_tx, first_half_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                PREBUFFER_BYTES * 2
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket
+                .write_all(&vec![1_u8; PREBUFFER_BYTES as usize])
+                .await
+                .unwrap();
+            let _ = first_half_tx.send(());
+            let _ = release_rx.await;
+            socket
+                .write_all(&vec![2_u8; PREBUFFER_BYTES as usize])
+                .await
+                .unwrap();
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            download_audio(&reqwest::Client::new(), &url, 20, &tx, true).await
+        });
+        first_half_rx.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err());
+        release_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(matches!(rx.recv().await, Some(DownloadEvent::Ready(20, _))));
     }
 
     #[tokio::test]
@@ -631,7 +690,7 @@ mod tests {
             }
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
-        download_audio(&reqwest::Client::new(), &url, 17, &tx)
+        download_audio(&reqwest::Client::new(), &url, 17, &tx, false)
             .await
             .unwrap();
         server.await.unwrap();
@@ -705,10 +764,9 @@ mod tests {
             }
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let download =
-            tokio::spawn(
-                async move { download_audio(&reqwest::Client::new(), &url, 19, &tx).await },
-            );
+        let download = tokio::spawn(async move {
+            download_audio(&reqwest::Client::new(), &url, 19, &tx, false).await
+        });
         let DownloadEvent::Ready(19, mut reader) = rx.recv().await.unwrap() else {
             panic!("missing prebuffered reader");
         };
@@ -776,7 +834,7 @@ mod tests {
             }
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let error = download_audio(&reqwest::Client::new(), &url, 18, &tx)
+        let error = download_audio(&reqwest::Client::new(), &url, 18, &tx, false)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("偏移 1048576 返回 HTTP 403"));
@@ -980,6 +1038,7 @@ mod tests {
                 .send(PlayerCmd::Load {
                     url: url.clone(),
                     play_seq: seq,
+                    wait_for_complete: false,
                 })
                 .unwrap();
             let detected = next_loopback_signal(&signal_rx)
@@ -1075,7 +1134,7 @@ mod tests {
             socket.write_all(&body).await.unwrap();
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
-        download_audio(&reqwest::Client::new(), &url, 31, &tx)
+        download_audio(&reqwest::Client::new(), &url, 31, &tx, false)
             .await
             .unwrap();
         server.await.unwrap();
@@ -1156,6 +1215,7 @@ mod tests {
                 .send(PlayerCmd::Load {
                     url: url.clone(),
                     play_seq,
+                    wait_for_complete: false,
                 })
                 .unwrap();
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -1248,6 +1308,7 @@ mod tests {
                 .send(PlayerCmd::Load {
                     url: url.clone(),
                     play_seq,
+                    wait_for_complete: false,
                 })
                 .unwrap();
             tokio::time::timeout(Duration::from_secs(30), async {
@@ -1317,7 +1378,7 @@ mod tests {
             .unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        download_audio(&client, &url, 42, &tx).await.unwrap();
+        download_audio(&client, &url, 42, &tx, false).await.unwrap();
         let DownloadEvent::Ready(42, reader) = rx.recv().await.unwrap() else {
             panic!("missing AAC reader");
         };
@@ -1358,7 +1419,7 @@ mod tests {
                 .await
                 .unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
-            download_audio(&client, &url, index as u64, &tx)
+            download_audio(&client, &url, index as u64, &tx, false)
                 .await
                 .unwrap_or_else(|error| panic!("{}: {error:#}", track.video_id));
             let DownloadEvent::Ready(_, reader) = rx.recv().await.unwrap() else {
@@ -1407,7 +1468,7 @@ mod tests {
                 let result = match api.stream_url(&track.video_id, StreamFormat::Mp4Aac).await {
                     Ok(url) => {
                         let (tx, mut rx) = mpsc::unbounded_channel();
-                        download_audio(&client, &url, index as u64, &tx)
+                        download_audio(&client, &url, index as u64, &tx, false)
                             .await
                             .map(|()| rx.try_recv().expect("completed download has no reader"))
                     }
@@ -1476,7 +1537,13 @@ mod tests {
                 .await
                 .unwrap();
             let play_seq = index as u64 + 1;
-            cmd_tx.send(PlayerCmd::Load { url, play_seq }).unwrap();
+            cmd_tx
+                .send(PlayerCmd::Load {
+                    url,
+                    play_seq,
+                    wait_for_complete: false,
+                })
+                .unwrap();
             let mut loaded = false;
             let mut furthest = 0.0_f64;
             tokio::time::timeout(Duration::from_secs(600), async {
@@ -1507,6 +1574,68 @@ mod tests {
             assert!(loaded && furthest > 30.0, "{} never played", track.video_id);
             println!("{}: played to end, furthest={furthest:.1}s", track.video_id);
         }
+        cmd_tx.send(PlayerCmd::Shutdown).unwrap();
+        player.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires network access and a real audio output device"]
+    async fn reported_song_plays_to_end() {
+        use crate::api::rustypipe::RustyPipeApi;
+        use crate::api::{MusicApi, StreamFormat};
+
+        let dir = tempfile::tempdir().unwrap();
+        let api = RustyPipeApi::new(dir.path().join("rustypipe")).unwrap();
+        let url = api
+            .stream_url("f8wH5iUMaKc", StreamFormat::Mp4Aac)
+            .await
+            .unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let player = tokio::spawn(run(0, cmd_rx, ev_tx));
+        assert!(matches!(ev_rx.recv().await, Some(PlayerEvent::Ready)));
+        cmd_tx
+            .send(PlayerCmd::Load {
+                url,
+                play_seq: 1,
+                wait_for_complete: false,
+            })
+            .unwrap();
+        let (played, duration) = tokio::time::timeout(Duration::from_secs(600), async {
+            let mut furthest = 0.0_f64;
+            let mut duration = None;
+            loop {
+                match ev_rx.recv().await.expect("native player stopped") {
+                    PlayerEvent::Track {
+                        play_seq: 1,
+                        event: TrackEvent::TimePos(position),
+                    } => furthest = furthest.max(position),
+                    PlayerEvent::Track {
+                        play_seq: 1,
+                        event: TrackEvent::Duration(seconds),
+                    } => duration = Some(seconds),
+                    PlayerEvent::Track {
+                        play_seq: 1,
+                        event: TrackEvent::LoadFailed(error),
+                    } => panic!("native load failed before 30s: {error}"),
+                    PlayerEvent::Track {
+                        play_seq: 1,
+                        event: TrackEvent::TrackEnded,
+                    } => break (furthest, duration),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("reported song did not finish");
+        assert!(played > 30.0, "reported song ended after {played:.1}s");
+        if let Some(duration) = duration {
+            assert!(
+                played + 5.0 >= duration,
+                "reported song stopped at {played:.1}s of {duration:.1}s"
+            );
+        }
+        println!("reported song played to end: {played:.1}s of {duration:?}");
         cmd_tx.send(PlayerCmd::Shutdown).unwrap();
         player.await.unwrap();
     }
@@ -1576,7 +1705,13 @@ mod tests {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let player = tokio::spawn(run(0, cmd_rx, ev_tx));
         assert!(matches!(ev_rx.recv().await, Some(PlayerEvent::Ready)));
-        cmd_tx.send(PlayerCmd::Load { url, play_seq: 1 }).unwrap();
+        cmd_tx
+            .send(PlayerCmd::Load {
+                url,
+                play_seq: 1,
+                wait_for_complete: false,
+            })
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(90), async {
             loop {
                 match ev_rx.recv().await.expect("player event channel closed") {
@@ -1676,6 +1811,7 @@ mod tests {
             .send(PlayerCmd::Load {
                 url: url.clone(),
                 play_seq: 1,
+                wait_for_complete: false,
             })
             .unwrap();
         tokio::time::timeout(Duration::from_secs(45), async {
@@ -1787,7 +1923,13 @@ mod tests {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let player = tokio::spawn(run(0, cmd_rx, ev_tx));
         assert!(matches!(ev_rx.recv().await, Some(PlayerEvent::Ready)));
-        cmd_tx.send(PlayerCmd::Load { url, play_seq: 1 }).unwrap();
+        cmd_tx
+            .send(PlayerCmd::Load {
+                url,
+                play_seq: 1,
+                wait_for_complete: false,
+            })
+            .unwrap();
 
         // The MP4 decoder may not know the duration until later segments are
         // downloaded; the UI already has this value from search metadata.

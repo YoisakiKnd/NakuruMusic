@@ -515,6 +515,7 @@ pub struct App {
     pub settings_selected: usize,
     pub engine_switch_pending: bool,
     pub status: Option<String>,
+    pub playback_error: Option<String>,
     status_ttl: u8,
     pub detail_retry_hint: Option<String>,
 
@@ -649,6 +650,7 @@ impl App {
             settings_selected: 0,
             engine_switch_pending: false,
             status: None,
+            playback_error: None,
             status_ttl: 0,
             detail_retry_hint: None,
             api,
@@ -947,9 +949,12 @@ impl App {
             return false;
         }
         self.stream_attempt += 1;
+        self.player.send(PlayerCmd::Stop);
+        self.playback_error = None;
         self.load_requested = false;
         self.pb.loading = true;
         self.pb.loading_secs = 0.0;
+        self.pb.paused = true;
         self.toast(format!("重新解析播放地址 ({}/2)", self.stream_attempt));
         let api = self.api.clone();
         let tx = self.tx.clone();
@@ -979,6 +984,29 @@ impl App {
         true
     }
 
+    fn native_ended_early(&self) -> Option<f64> {
+        let expected = self
+            .now_playing
+            .as_ref()
+            .and_then(|track| track.duration_secs)
+            .map(f64::from)
+            .unwrap_or(self.pb.duration);
+        (expected >= 20.0
+            && self.pb.time_pos.is_finite()
+            && self.pb.time_pos + 5.0 < expected * 0.7)
+            .then_some(expected)
+    }
+
+    fn fail_current_track(&mut self, error: String) {
+        tracing::warn!(position = self.pb.time_pos, "current track failed: {error}");
+        self.player.send(PlayerCmd::Stop);
+        self.load_requested = false;
+        self.pb.loading = false;
+        self.pb.paused = true;
+        self.playback_error = Some("当前曲目播放中断：按 R 重试，或按 n 播放下一首".into());
+        self.toast(error);
+    }
+
     fn start_track(&mut self, track: Track) {
         self.track_tasks.abort();
         self.play_seq = self.play_seq.wrapping_add(1);
@@ -995,6 +1023,7 @@ impl App {
             self.resume_position = None;
         }
         self.current_video_id = Some(track.video_id.clone());
+        self.playback_error = None;
         self.stream_attempt = 0;
         self.load_requested = false;
 
@@ -1112,6 +1141,7 @@ impl App {
         self.pb.time_pos = 0.0;
         self.pb.duration = 0.0;
         self.current_video_id = None;
+        self.playback_error = None;
         self.resume_target_id = None;
         self.resume_position = None;
         self.load_requested = false;
@@ -1204,6 +1234,26 @@ impl App {
                 if self.pb.loading || self.current_video_id.is_none() {
                     return;
                 }
+                if self.config.playback.engine == PlaybackEngine::Native {
+                    if let Some(expected) = self.native_ended_early() {
+                        tracing::warn!(
+                            position = self.pb.time_pos,
+                            expected,
+                            "native playback ended early"
+                        );
+                        if self.pb.time_pos > 1.0 {
+                            self.resume_position = Some(self.pb.time_pos);
+                        }
+                        if self.retry_stream_resolution(
+                            self.play_seq,
+                            self.current_video_id.clone().unwrap(),
+                        ) {
+                            return;
+                        }
+                        self.fail_current_track("内置播放器提前结束，已停止自动切歌".into());
+                        return;
+                    }
+                }
                 let adv = self.queue.advance_on_end();
                 self.advance(adv);
             }
@@ -1222,11 +1272,7 @@ impl App {
                         return;
                     }
                 }
-                self.load_requested = false;
-                self.pb.loading = false;
-                self.toast(format!("加载失败，跳到下一首: {e}"));
-                let adv = self.queue.next_manual();
-                self.advance(adv);
+                self.fail_current_track(format!("加载失败: {e}"));
             }
         }
     }
@@ -1520,17 +1566,19 @@ impl App {
                             || self.config.playback.engine == PlaybackEngine::Native
                         {
                             tracing::warn!("stream resolution failed, no ytdl fallback: {e}");
-                            self.pb.loading = false;
-                            self.toast(format!("解析播放地址失败，跳到下一首: {e}"));
-                            let adv = self.queue.next_manual();
-                            self.advance(adv);
+                            self.fail_current_track(format!("解析播放地址失败: {e}"));
                             return;
                         }
                         tracing::warn!("stream resolution failed, falling back to ytdl hook: {e}");
                         format!("https://music.youtube.com/watch?v={video_id}")
                     }
                 };
-                self.load_requested = self.player.send_checked(PlayerCmd::Load { url, play_seq });
+                self.load_requested = self.player.send_checked(PlayerCmd::Load {
+                    url,
+                    play_seq,
+                    wait_for_complete: attempt > 0
+                        && self.config.playback.engine == PlaybackEngine::Native,
+                });
                 if !self.load_requested {
                     self.pb.loading = false;
                     self.toast("播放器未运行 - 按 R 重启");
@@ -1855,7 +1903,11 @@ impl App {
                 }
             }
             Action::RestartPlayer => {
-                if !self.pb.alive {
+                if self.pb.alive && self.playback_error.is_some() {
+                    if let Some(index) = self.queue.current_index() {
+                        self.start_track_at(index);
+                    }
+                } else if !self.pb.alive {
                     self.restart_pending_track = self.current_video_id.is_some();
                     self.player_epoch = self.player_epoch.wrapping_add(1);
                     self.player_restart_requested = true;
@@ -2968,6 +3020,63 @@ mod tests {
         app.load_requested = true;
         app.on_track_event(TrackEvent::LoadFailed("音频下载失败: HTTP 403".into()));
         assert!(!app.pb.loading);
+    }
+
+    #[tokio::test]
+    async fn premature_native_end_retries_without_advancing_queue() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("first"), track("second")], 0);
+        app.pb.loading = false;
+        app.pb.time_pos = 4.0;
+        app.pb.duration = 5.0; // A truncated decoder can report a short duration.
+        app.on_track_event(TrackEvent::TrackEnded);
+        assert_eq!(app.current_video_id.as_deref(), Some("first"));
+        assert_eq!(app.stream_attempt, 1);
+        assert_eq!(app.resume_position, Some(4.0));
+        assert!(app.pb.loading);
+    }
+
+    #[tokio::test]
+    async fn exhausted_native_retries_keep_track_and_allow_manual_retry() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("first"), track("second")], 0);
+        app.pb.loading = false;
+        app.pb.time_pos = 4.0;
+        app.stream_attempt = 2;
+        app.on_track_event(TrackEvent::TrackEnded);
+        assert_eq!(app.current_video_id.as_deref(), Some("first"));
+        assert!(app.playback_error.is_some());
+        assert!(app.pb.paused);
+
+        app.pb.alive = true;
+        app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert_eq!(app.current_video_id.as_deref(), Some("first"));
+        assert_eq!(app.stream_attempt, 0);
+        assert!(app.playback_error.is_none());
+        assert!(app.pb.loading);
+    }
+
+    #[tokio::test]
+    async fn exhausted_download_failure_does_not_skip_queue() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("first"), track("second")], 0);
+        app.pb.loading = false;
+        app.load_requested = true;
+        app.stream_attempt = 2;
+        app.on_track_event(TrackEvent::LoadFailed("音频下载失败: HTTP 403".into()));
+        assert_eq!(app.current_video_id.as_deref(), Some("first"));
+        assert!(app.playback_error.is_some());
+        assert!(!app.pb.loading);
+    }
+
+    #[tokio::test]
+    async fn natural_native_end_advances_queue() {
+        let (mut app, _) = test_app();
+        app.play_context(vec![track("first"), track("second")], 0);
+        app.pb.loading = false;
+        app.pb.time_pos = 119.0;
+        app.on_track_event(TrackEvent::TrackEnded);
+        assert_eq!(app.current_video_id.as_deref(), Some("second"));
     }
 
     #[tokio::test]

@@ -20,6 +20,9 @@ pub enum PlayerCmd {
     Load {
         url: String,
         play_seq: u64,
+        /// On a recovery attempt, decode only after the entire temporary file
+        /// is present so a streaming demuxer cannot mistake a gap for EOF.
+        wait_for_complete: bool,
     },
     Stop,
     TogglePause,
@@ -137,7 +140,7 @@ async fn player_task(
 
     while let Some(cmd) = cmd_rx.recv().await {
         let result = match cmd {
-            PlayerCmd::Load { url, play_seq } => {
+            PlayerCmd::Load { url, play_seq, .. } => {
                 // Stream URLs carry credentials in the query string - log the
                 // origin only, never the full URL.
                 info!(

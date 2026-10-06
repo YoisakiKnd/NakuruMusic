@@ -19,15 +19,31 @@ struct State {
 
 pub(super) struct ProgressiveFile {
     file: File,
+    writer_file: File,
     state: Mutex<State>,
     changed: Condvar,
     request_signal: Notify,
 }
 
 impl ProgressiveFile {
-    pub(super) fn new(file: File, total: Option<u64>) -> Arc<Self> {
-        Arc::new(Self {
+    pub(super) fn new(total: Option<u64>) -> io::Result<Arc<Self>> {
+        // File::try_clone shares a cursor. On Windows, seek_read moves that
+        // cursor, so the writer must be opened independently or later audio
+        // chunks may overwrite earlier bytes while the decoder reads.
+        #[cfg(windows)]
+        let (file, writer_file) = {
+            let named = tempfile::NamedTempFile::new()?;
+            (named.reopen()?, named.reopen()?)
+        };
+        #[cfg(not(windows))]
+        let (file, writer_file) = {
+            let file = tempfile::tempfile()?;
+            let writer_file = file.try_clone()?;
+            (file, writer_file)
+        };
+        Ok(Arc::new(Self {
             file,
+            writer_file,
             state: Mutex::new(State {
                 available: Vec::new(),
                 requested: None,
@@ -37,11 +53,11 @@ impl ProgressiveFile {
             }),
             changed: Condvar::new(),
             request_signal: Notify::new(),
-        })
+        }))
     }
 
     pub(super) fn writer(&self) -> io::Result<File> {
-        self.file.try_clone()
+        self.writer_file.try_clone()
     }
 
     pub(super) fn reader(self: &Arc<Self>) -> ProgressiveReader {
@@ -234,8 +250,7 @@ mod tests {
 
     #[test]
     fn reader_waits_for_published_bytes_and_wakes_on_cancel() {
-        let file = tempfile::tempfile().unwrap();
-        let shared = ProgressiveFile::new(file, Some(10));
+        let shared = ProgressiveFile::new(Some(10)).unwrap();
         let mut writer = shared.writer().unwrap();
         let mut guard = WriterGuard::new(shared.clone());
         writer.write_all(b"hello").unwrap();
@@ -255,13 +270,13 @@ mod tests {
         guard.complete();
         assert_eq!(&task.join().unwrap().unwrap(), b"world");
 
-        let failed = ProgressiveFile::new(tempfile::tempfile().unwrap(), None);
+        let failed = ProgressiveFile::new(None).unwrap();
         let mut waiting = failed.reader();
         let guard = WriterGuard::new(failed);
         drop(guard);
         assert!(waiting.read(&mut [0; 1]).is_err());
 
-        let unknown = ProgressiveFile::new(tempfile::tempfile().unwrap(), None);
+        let unknown = ProgressiveFile::new(None).unwrap();
         let mut writer = unknown.writer().unwrap();
         writer.write_all(b"abc").unwrap();
         unknown.publish(3);
@@ -272,7 +287,7 @@ mod tests {
 
     #[test]
     fn sparse_read_requests_far_segment_before_middle_bytes_exist() {
-        let shared = ProgressiveFile::new(tempfile::tempfile().unwrap(), Some(12));
+        let shared = ProgressiveFile::new(Some(12)).unwrap();
         let mut writer = shared.writer().unwrap();
         writer.write_all(b"head").unwrap();
         shared.publish_range(0, 4);
@@ -299,5 +314,24 @@ mod tests {
         shared.publish_range(8, 12);
         assert_eq!(&waiting.join().unwrap().unwrap(), b"tail");
         assert_eq!(shared.reader().known_len(), Some(12));
+    }
+
+    #[test]
+    fn decoder_reads_cannot_move_download_writer_cursor() {
+        let shared = ProgressiveFile::new(Some(6)).unwrap();
+        let mut writer = shared.writer().unwrap();
+        writer.write_all(b"abcd").unwrap();
+        shared.publish(4);
+
+        let mut decoder = shared.reader();
+        let mut first = [0; 1];
+        decoder.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"a");
+
+        writer.write_all(b"ef").unwrap();
+        shared.publish(6);
+        let mut complete = [0; 6];
+        shared.reader().read_exact(&mut complete).unwrap();
+        assert_eq!(&complete, b"abcdef");
     }
 }
