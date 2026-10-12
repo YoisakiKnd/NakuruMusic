@@ -147,6 +147,7 @@ const CANDIDATES: &[Candidate] = &[
         store: CookieStore::Firefox,
         paths: &[
             (Base::Home, ".mozilla/firefox"),
+            (Base::Home, ".config/mozilla/firefox"),
             (Base::Home, "snap/firefox/common/.mozilla/firefox"),
         ],
     },

@@ -93,6 +93,42 @@ cargo build --release
 # 产物: target\release\nakuru-music.exe，单文件可任意拷贝
 ```
 
+### Nix / NixOS
+
+支持 `x86_64-linux` 和 `aarch64-linux`。启用 Nix 的 `nix-command` 和 `flakes`
+实验特性后，在项目根目录运行：
+
+```sh
+nix build                  # 产物: ./result/bin/nakuru-music
+nix run                    # 构建并启动 TUI
+nix develop                # 进入包含 Rust 工具链和原生依赖的开发环境
+nix flake check            # 构建并运行不联网的测试
+```
+
+flake 自动提供 ALSA、OpenSSL 等构建依赖，并保留 `vendor/` 中的本地补丁。
+`flake.lock` 固定 nixpkgs 及 Rust 工具链，`Cargo.lock` 固定 Rust 依赖。
+默认内置播放不需要 mpv；如需 mpv 模式或 yt-dlp 兜底，请另行安装对应软件。
+
+在自己的 NixOS flake 中添加输入：
+
+```nix
+inputs.nakuru-music.url = "github:YoisakiKnd/NakuruMusic";
+```
+
+然后将包加入 NixOS 模块（`inputs` 通过 `specialArgs = { inherit inputs; };` 传入）：
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  environment.systemPackages = [
+    inputs.nakuru-music.packages.${pkgs.stdenv.hostPlatform.system}.default
+  ];
+}
+```
+
+若自行添加或修改 flake，新文件需要先 `git add flake.nix flake.lock`，
+以便 Nix 在 Git 工作目录中读取它们。
+
 ## 开发
 
 ```powershell
